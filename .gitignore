@@ -1,0 +1,31 @@
+.DS_Store
+.superpowers/sdd/
+var/folders/
+ssh-keys/
+navi48-native/venv/
+**/build/
+tools/pico-login/build*/
+
+# Third-party references / large local artifacts (not part of the driver)
+navi48/
+navi48-native/
+tools/dyld-inspect/
+tools/pico-login/
+dist/metal/
+dist/xlate-patches/
+archive/
+*.dmg
+*.tgz
+*.zip
+# Editor/scratch copies left in src
+RDNA4Driver/src/**/*.bak*
+RDNA4Driver/src/**/*.broken*
+RDNA4Driver/src/**/*.final*
+RDNA4Driver/src/**/*.fix*
+RDNA4Driver/src/**/*.dedup
+RDNA4Driver/src/**/*.precise
+RDNA4Driver/src/**/*.restore
+RDNA4Driver/src/**/*.addinclude
+RDNA4Driver/src/**/*.backup
+RDNA4Driver/src/**/*.ioreg
+RDNA4Driver/Makefile.bak*

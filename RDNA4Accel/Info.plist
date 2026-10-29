@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>RDNA4Accel</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.rdna4.accel</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>RDNA4Accel</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RDNA4Accel</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.rdna4.accel</string>
+			<key>IOClass</key>
+			<string>RDNA4Accel</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOProviderClass</key>
+			<string>RDNA4Driver</string>
+			<key>IOProbeScore</key>
+			<integer>5000</integer>
+			<key>MetalPluginClassName</key>
+			<string>RDNA4Device</string>
+			<key>MetalPluginName</key>
+			<string>RDNA4</string>
+			<key>MetalPluginType</key>
+			<string>Device</string>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>2.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>22.0.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>22.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>22.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>22.0.0</string>
+	</dict>
+</dict>
+</plist>

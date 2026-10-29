@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clean *)",
+      "Bash(make)",
+      "Bash(plutil -lint build/RDNA4Driver.kext/Contents/Info.plist)"
+    ]
+  }
+}

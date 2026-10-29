@@ -1,0 +1,27 @@
+# Build artifacts
+bin/
+obj/
+*.o
+*.a
+
+# Generated files
+*.s
+*.bc
+*.ll
+*.log
+
+# Test outputs
+output/
+shader_stats.csv
+/tmp/*.metallib
+/tmp/*.air
+
+# macOS
+.DS_Store
+._*
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
