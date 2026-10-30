@@ -96,13 +96,53 @@ constexpr uint64_t alignUp(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+// GPU 直接 DMA 的系统内存必须 online 且物理连续：GART 表项保存的是物理
+// 地址，硬件不会替我们做页交叉。IOBufferMemoryDescriptor::withCapacity 返回
+// 的可分页内存两条都不保证，因此统一走 inTaskWithPhysicalMask。
+IOBufferMemoryDescriptor* gmcAllocContiguous(uint64_t bytes) {
+    if (bytes == 0) return nullptr;
+    bytes = alignUp(bytes, GPU_PAGE_SIZE);
+    // 48 位物理地址上限，并按页对齐掩码保证起始地址页对齐。
+    const mach_vm_address_t mask =
+        (0x0000FFFFFFFFFFFFULL) & ~static_cast<mach_vm_address_t>(GPU_PAGE_SIZE - 1);
+    IOBufferMemoryDescriptor* md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task,
+        kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone,
+        bytes, mask);
+    if (!md) return nullptr;
+    if (md->prepare() != kIOReturnSuccess) {
+        md->release();
+        return nullptr;
+    }
+    return md;
+}
+
+uint64_t gmcPhysicalAddress(IOBufferMemoryDescriptor* md) {
+    if (!md) return 0;
+    IOByteCount segment = 0;
+    const addr64_t phys = md->getPhysicalSegment(0, &segment, kIOMemoryMapperNone);
+    if (!phys || segment < md->getLength()) {
+        // 分段说明分配器没能给出连续物理内存，调用者必须失败而不是把
+        // 半个 buffer 的地址写进页表。
+        return 0;
+    }
+    return static_cast<uint64_t>(phys);
+}
+
+void gmcReleaseContiguous(IOBufferMemoryDescriptor* md, bool prepared) {
+    if (!md) return;
+    if (prepared) md->complete();
+    md->release();
+}
+
 } // namespace
 
 void gmcFini(GMCContext& gmc) {
     if (gmc.dummyPage) {
-        gmc.dummyPage->release();
+        gmcReleaseContiguous(gmc.dummyPage, gmc.dummyPagePrepared);
         gmc.dummyPage = nullptr;
     }
+    gmc.dummyPagePrepared = false;
     gmc.dummyPagePhys = 0;
     gmc.gartTableVramOffset = 0;
     gmc.gartTableSize = 0;
@@ -174,15 +214,17 @@ bool gmcReadVRAMInfo(RDNA4Driver& driver, GMCContext& gmc) {
 }
 
 bool gmcAllocateGART(RDNA4Driver& driver, GMCContext& gmc) {
-    // Dummy page：所有 GART 表项和页错误默认地址都指向它。
-    gmc.dummyPage = IOBufferMemoryDescriptor::withCapacity(
-        GPU_PAGE_SIZE, kIODirectionInOut, true);
+    // Dummy page：所有 GART 表项和页错误默认地址都指向它。 它会被写进 GPU
+    // 可访问的页表项，所以必须是线上（wired）、物理连续的页面：可分页内存
+    // 一旦被换出，GPU 就会读写到别处。
+    gmc.dummyPage = gmcAllocContiguous(GPU_PAGE_SIZE);
     if (!gmc.dummyPage) {
         LOG("GMC: failed to allocate dummy page");
         return false;
     }
+    gmc.dummyPagePrepared = true;
 
-    gmc.dummyPagePhys = gmc.dummyPage->getPhysicalAddress();
+    gmc.dummyPagePhys = gmcPhysicalAddress(gmc.dummyPage);
     if (!gmc.dummyPagePhys) {
         LOG("GMC: failed to get dummy page physical address");
         gmcFini(gmc);
@@ -597,14 +639,14 @@ uint64_t gmcAllocGartBuffer(RDNA4Driver& driver, GMCContext& gmc, size_t size,
         return 0;
     }
 
-    IOBufferMemoryDescriptor* md = IOBufferMemoryDescriptor::withCapacity(
-        static_cast<vm_size_t>(pages) * GPU_PAGE_SIZE, kIODirectionInOut, true);
+    IOBufferMemoryDescriptor* md = gmcAllocContiguous(
+        static_cast<uint64_t>(pages) * GPU_PAGE_SIZE);
     if (!md)
         return 0;
 
-    const uint64_t phys = md->getPhysicalAddress();
+    const uint64_t phys = gmcPhysicalAddress(md);
     if (!phys) {
-        md->release();
+        gmcReleaseContiguous(md, true);
         return 0;
     }
 
@@ -613,7 +655,7 @@ uint64_t gmcAllocGartBuffer(RDNA4Driver& driver, GMCContext& gmc, size_t size,
     driver.vramWindow(vram, vramSize);
     if (!vram || gmc.gartTableVramOffset > vramSize ||
         gmc.gartTableSize > vramSize - gmc.gartTableVramOffset) {
-        md->release();
+        gmcReleaseContiguous(md, true);
         return 0;
     }
 

@@ -97,6 +97,28 @@ private:
     ComputeRing* computeRing { nullptr };
     uint64_t computeHeapNext { 0 };
     uint64_t computeMqdGpuAddr { 0 };
+
+    // Bump allocator plus a small free list so released ranges are reusable.
+    // Without it a long-lived user-space client would exhaust the heap.
+    static const uint32_t kMaxVramBlocks = 64;
+    struct VramBlock {
+        uint64_t gpuAddr { 0 };
+        uint64_t size { 0 };
+    };
+    VramBlock vramLiveBlocks[kMaxVramBlocks];
+    uint32_t vramLiveBlockCount { 0 };
+    VramBlock vramFreeBlocks[kMaxVramBlocks];
+    uint32_t vramFreeBlockCount { 0 };
+    bool vramFreeInsert(uint64_t gpuAddr, uint64_t size);
+    uint64_t vramFreeTake(uint64_t size);
+    void vramBlocksReset();
+
+    // Phase 3.3 user window bump pointer (see VramLayout::kUserHeap).
+    uint64_t userHeapNext { 0 };
+
+    // Serialises ring writes: two clients submitting at once would interleave
+    // PM4 dwords and hand the CP a corrupt stream.
+    IOLock* submitLock { nullptr };
     // MES maps the queue itself: the MQD must say active=0 so the map packet,
     // not the MQD contents, brings the HQD up.
     bool computeQueueViaMes { false };
@@ -167,6 +189,10 @@ private:
     // Distinct from the rptr report page: sharing one page makes the CP poll
     // and write back through the same address.
     uint64_t computeWptrPollGpuAddr { 0 };
+    // GPU-written read pointer for the ring (MQD cp_hqd_pq_rptr_report_addr).
+    uint64_t computeRptrGpuAddr { 0 };
+    // Pulls the CP's read pointer into the ring so released space is reusable.
+    void refreshRingReadPtr();
     uint64_t mesUcStart { 0 };
     uint64_t computeWptrGpuAddr { 0 };
     bool activateComputeQueue();
@@ -264,15 +290,34 @@ private:
 public:
     // Allocate buffer in VRAM (returns GPU address)
     uint64_t allocateVRAMBuffer(size_t size);
-    
+
+    // Phase 3.3: one PM4 submission, serialised against other submitters.
+    // Returns false when the ring could not accept the stream.
+    bool submitComputeCommands(const uint32_t* pm4Data, size_t dwordCount);
+    bool submitComputeCommandsLocked(const uint32_t* pm4Data, size_t dwordCount);
+
+    // Phase 3.3: allocate inside the user-visible window only. A user-space
+    // client may map that window and nothing else, so handing out any other
+    // VRAM address here would be a privilege escape.
+    uint64_t allocateUserVRAMBuffer(size_t size);
+    uint64_t userHeapGpuAddr() const;
+    uint64_t userHeapSize() const;
+    // Descriptor for the user window, for IOUserClient::clientMemoryForType.
+    IOMemoryDescriptor* copyUserHeapDescriptor();
+
     // Free VRAM buffer
     void freeVRAMBuffer(uint64_t gpuAddress);
-    
-    // Submit PM4 commands to compute ring
-    bool submitComputeCommands(const uint32_t* pm4Data, size_t dwordCount);
-    
+
     // Wait for compute completion
     bool waitForComputeFence(uint64_t fenceValue, uint64_t timeoutMS);
+
+    // Phase 3.3: the driver owns the fence counter, so user space never has to
+    // guess a value the GPU will write.
+    uint64_t allocFenceValue();
+    uint64_t computeFenceGpuAddr();
+
+    virtual IOReturn newUserClient(task_t owningTask, void* securityID,
+                                   UInt32 type, IOUserClient** handler) override;
     
 private:
 

@@ -58,6 +58,10 @@ bool RDNA4Driver::initComputeRing() {
         return false;
     }
 
+    // Phase 3.3: the user-visible window starts empty; the first user
+    // allocation seeds userHeapNext.
+    userHeapNext = 0;
+
     computeHeapNext = VramLayout::kComputeHeap;
 
     // Phase 2.4: give the ring to the CP/MEC queue. MQD, EOP and the rptr
@@ -67,6 +71,8 @@ bool RDNA4Driver::initComputeRing() {
     const uint64_t eopAddr = allocateVRAMBuffer(4096);
     const uint64_t rptrAddr = allocateVRAMBuffer(4096);
     const uint64_t wptrAddr = allocateVRAMBuffer(4096);
+    // GPU-written read pointer for refreshRingReadPtr().
+    computeRptrGpuAddr = rptrAddr;
     computeWptrPollGpuAddr = wptrAddr;
     bool queueOk = false;
 
@@ -179,19 +185,47 @@ uint64_t RDNA4Driver::allocateVRAMBuffer(size_t size) {
     }
 
     constexpr uint64_t alignment = 0x1000;
+    if (size > UINT32_MAX) {
+        LOG_ERROR("allocateVRAMBuffer: request %zu exceeds the 4 GiB heap limit", size);
+        return 0;
+    }
     uint64_t allocSize = (static_cast<uint64_t>(size) + alignment - 1) &
                          ~(alignment - 1);
-    if (allocSize < size || computeHeapNext > vramSize ||
-        allocSize > vramSize - computeHeapNext) {
-        LOG_ERROR("allocateVRAMBuffer: out of VRAM (need %llu, available %llu)",
+
+    // Reuse a released range when one is big enough; the bump pointer below
+    // only ever grows.
+    if (const uint64_t reused = vramFreeTake(allocSize)) {
+        LOG("allocateVRAMBuffer: reused %llu bytes at GPU 0x%llx",
+            static_cast<unsigned long long>(allocSize),
+            static_cast<unsigned long long>(reused));
+        return reused;
+    }
+
+    // The kernel heap must stop at the user window: a user mapping of that
+    // range would otherwise expose kernel-owned PSP/GFX buffers.
+    const uint64_t heapCeiling = VramLayout::kUserHeap < vramSize
+        ? VramLayout::kUserHeap : vramSize;
+    if (allocSize < size || computeHeapNext > heapCeiling ||
+        allocSize > heapCeiling - computeHeapNext) {
+        LOG_ERROR("allocateVRAMBuffer: out of kernel heap (need %llu, available %llu)",
                   static_cast<unsigned long long>(allocSize),
-                  static_cast<unsigned long long>(vramSize - computeHeapNext));
+                  static_cast<unsigned long long>(heapCeiling - computeHeapNext));
         return 0;
     }
 
     const uint64_t vramOffset = computeHeapNext;
     computeHeapNext += allocSize;
     const uint64_t gpuAddress = gmcContext.vramStart + vramOffset;
+
+    // Record the size so freeVRAMBuffer can release exactly this range.
+    if (vramLiveBlockCount < kMaxVramBlocks) {
+        vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
+        vramLiveBlocks[vramLiveBlockCount].size = allocSize;
+        vramLiveBlockCount++;
+    } else {
+        LOG_ERROR("allocateVRAMBuffer: live-block table full (%u) — the address "
+                  "cannot be released later", kMaxVramBlocks);
+    }
 
     LOG("allocateVRAMBuffer: allocated %llu bytes at GPU 0x%llx (VRAM+0x%llx)",
         static_cast<unsigned long long>(allocSize),
@@ -201,10 +235,206 @@ uint64_t RDNA4Driver::allocateVRAMBuffer(size_t size) {
     return gpuAddress;
 }
 
+uint64_t RDNA4Driver::userHeapGpuAddr() const {
+    return gmcContext.vramStart + VramLayout::kUserHeap;
+}
+
+uint64_t RDNA4Driver::userHeapSize() const {
+    // Never advertise more window than BAR0 actually maps.
+    if (vramSize <= VramLayout::kUserHeap) return 0;
+    const uint64_t available = vramSize - VramLayout::kUserHeap;
+    return available < VramLayout::kUserHeapSize ? available : VramLayout::kUserHeapSize;
+}
+
+uint64_t RDNA4Driver::allocateUserVRAMBuffer(size_t size) {
+    const uint64_t window = userHeapSize();
+    if (!vram || window == 0 || size == 0) {
+        LOG_ERROR("allocateUserVRAMBuffer: no user window (size=%zu, window=%llu)",
+                  size, static_cast<unsigned long long>(window));
+        return 0;
+    }
+
+    constexpr uint64_t alignment = 0x1000;
+    const uint64_t allocSize = (static_cast<uint64_t>(size) + alignment - 1) &
+                               ~(alignment - 1);
+    if (allocSize < size) {
+        LOG_ERROR("allocateUserVRAMBuffer: size %zu overflows", size);
+        return 0;
+    }
+
+    if (const uint64_t reused = vramFreeTake(allocSize)) {
+        // Only hand back addresses that live inside the user window.
+        const uint64_t base = userHeapGpuAddr();
+        if (reused >= base && reused - base < window &&
+            allocSize <= window - (reused - base)) {
+            LOG("allocateUserVRAMBuffer: reused %llu bytes at GPU 0x%llx",
+                static_cast<unsigned long long>(allocSize),
+                static_cast<unsigned long long>(reused));
+            return reused;
+        }
+        // A kernel-side range leaked into the free list position; put it back
+        // and fall through to the bump pointer.
+        vramFreeInsert(reused, allocSize);
+    }
+
+    if (userHeapNext == 0) userHeapNext = VramLayout::kUserHeap;
+    if (userHeapNext < VramLayout::kUserHeap ||
+        userHeapNext - VramLayout::kUserHeap > window ||
+        allocSize > window - (userHeapNext - VramLayout::kUserHeap)) {
+        LOG_ERROR("allocateUserVRAMBuffer: user window exhausted (need %llu of %llu)",
+                  static_cast<unsigned long long>(allocSize),
+                  static_cast<unsigned long long>(window));
+        return 0;
+    }
+
+    const uint64_t gpuAddress = gmcContext.vramStart + userHeapNext;
+    userHeapNext += allocSize;
+
+    if (vramLiveBlockCount < kMaxVramBlocks) {
+        vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
+        vramLiveBlocks[vramLiveBlockCount].size = allocSize;
+        vramLiveBlockCount++;
+    } else {
+        LOG_ERROR("allocateUserVRAMBuffer: live-block table full, 0x%llx cannot be freed",
+                  static_cast<unsigned long long>(gpuAddress));
+    }
+
+    LOG("allocateUserVRAMBuffer: %llu bytes at GPU 0x%llx (VRAM+0x%llx)",
+        static_cast<unsigned long long>(allocSize),
+        static_cast<unsigned long long>(gpuAddress),
+        static_cast<unsigned long long>(userHeapNext - allocSize));
+    return gpuAddress;
+}
+
+IOMemoryDescriptor* RDNA4Driver::copyUserHeapDescriptor() {
+    if (!pciDevice) return nullptr;
+    const uint64_t window = userHeapSize();
+    if (window == 0) {
+        LOG_ERROR("copyUserHeapDescriptor: user window is empty");
+        return nullptr;
+    }
+    IODeviceMemory* bar = pciDevice->getDeviceMemoryWithRegister(
+        kIOPCIConfigBaseAddress0);
+    if (!bar) {
+        LOG_ERROR("copyUserHeapDescriptor: BAR0 not available");
+        return nullptr;
+    }
+    IODeviceMemory* window_mem = IODeviceMemory::withSubRange(
+        bar, VramLayout::kUserHeap, static_cast<IOByteCount>(window));
+    if (!window_mem) {
+        LOG_ERROR("copyUserHeapDescriptor: cannot describe the user window");
+        return nullptr;
+    }
+    return window_mem;
+}
+
+void RDNA4Driver::refreshRingReadPtr() {
+    if (!computeRing || !computeRptrGpuAddr || !vram) return;
+    if (computeRptrGpuAddr < gmcContext.vramStart) return;
+    const uint64_t offset = computeRptrGpuAddr - gmcContext.vramStart;
+    if (offset + sizeof(uint32_t) > vramSize) return;
+    const uint32_t rptr = *reinterpret_cast<volatile uint32_t*>(
+        const_cast<uint8_t*>(vram) + offset);
+    computeRing->setReadPointer(rptr);
+}
+
 void RDNA4Driver::freeVRAMBuffer(uint64_t gpuAddress) {
-    // Stub: a real allocator must track and coalesce these ranges.
-    LOG("freeVRAMBuffer: GPU address 0x%llx (stub)",
-        static_cast<unsigned long long>(gpuAddress));
+    if (!computeRing || !vram || gpuAddress < gmcContext.vramStart) {
+        LOG_ERROR("freeVRAMBuffer: 0x%llx is not a heap address",
+                  static_cast<unsigned long long>(gpuAddress));
+        return;
+    }
+
+    for (uint32_t i = 0; i < vramLiveBlockCount; i++) {
+        if (vramLiveBlocks[i].gpuAddr != gpuAddress) continue;
+        const uint64_t size = vramLiveBlocks[i].size;
+        vramLiveBlocks[i] = vramLiveBlocks[--vramLiveBlockCount];
+        if (!vramFreeInsert(gpuAddress, size)) {
+            LOG_ERROR("freeVRAMBuffer: free list full, %llu bytes at 0x%llx leaked",
+                      static_cast<unsigned long long>(size),
+                      static_cast<unsigned long long>(gpuAddress));
+            return;
+        }
+        LOG("freeVRAMBuffer: released %llu bytes at GPU 0x%llx",
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(gpuAddress));
+        return;
+    }
+
+    // Buffers handed out by gmcAllocGartBuffer (GART aperture) or the fixed
+    // VRAM layout are not part of this heap and must not enter the free list.
+    LOG_ERROR("freeVRAMBuffer: 0x%llx was not allocated from the compute heap",
+              static_cast<unsigned long long>(gpuAddress));
+}
+
+// Insert a released range, merging it with any neighbour it touches.
+bool RDNA4Driver::vramFreeInsert(uint64_t gpuAddr, uint64_t size) {
+    if (size == 0) return true;
+
+    for (uint32_t i = 0; i < vramFreeBlockCount; i++) {
+        VramBlock& b = vramFreeBlocks[i];
+        if (b.gpuAddr + b.size == gpuAddr) {           // grows up
+            b.size += size;
+            for (uint32_t j = 0; j < vramFreeBlockCount; j++) {
+                VramBlock& n = vramFreeBlocks[j];
+                if (j != i && n.gpuAddr == b.gpuAddr + b.size) {
+                    b.size += n.size;
+                    vramFreeBlocks[j] = vramFreeBlocks[--vramFreeBlockCount];
+                    break;
+                }
+            }
+            return true;
+        }
+        if (gpuAddr + size == b.gpuAddr) {              // grows down
+            b.gpuAddr = gpuAddr;
+            b.size += size;
+            for (uint32_t j = 0; j < vramFreeBlockCount; j++) {
+                VramBlock& n = vramFreeBlocks[j];
+                if (j != i && n.gpuAddr + n.size == b.gpuAddr) {
+                    b.gpuAddr = n.gpuAddr;
+                    b.size += n.size;
+                    vramFreeBlocks[j] = vramFreeBlocks[--vramFreeBlockCount];
+                    break;
+                }
+            }
+            return true;
+        }
+    }
+
+    if (vramFreeBlockCount >= kMaxVramBlocks) return false;
+    vramFreeBlocks[vramFreeBlockCount].gpuAddr = gpuAddr;
+    vramFreeBlocks[vramFreeBlockCount].size = size;
+    vramFreeBlockCount++;
+    return true;
+}
+
+// First fit; a block larger than the request keeps its tail free.
+uint64_t RDNA4Driver::vramFreeTake(uint64_t size) {
+    for (uint32_t i = 0; i < vramFreeBlockCount; i++) {
+        VramBlock& b = vramFreeBlocks[i];
+        if (b.size < size) continue;
+        const uint64_t addr = b.gpuAddr;
+        if (b.size == size) {
+            vramFreeBlocks[i] = vramFreeBlocks[--vramFreeBlockCount];
+        } else {
+            b.gpuAddr += size;
+            b.size -= size;
+        }
+        if (vramLiveBlockCount < kMaxVramBlocks) {
+            vramLiveBlocks[vramLiveBlockCount].gpuAddr = addr;
+            vramLiveBlocks[vramLiveBlockCount].size = size;
+            vramLiveBlockCount++;
+        }
+        return addr;
+    }
+    return 0;
+}
+
+void RDNA4Driver::vramBlocksReset() {
+    for (uint32_t i = 0; i < vramLiveBlockCount; i++) vramLiveBlocks[i] = VramBlock{};
+    for (uint32_t i = 0; i < vramFreeBlockCount; i++) vramFreeBlocks[i] = VramBlock{};
+    vramLiveBlockCount = 0;
+    vramFreeBlockCount = 0;
 }
 
 bool RDNA4Driver::submitComputeCommands(const uint32_t* pm4Data, size_t dwordCount) {
@@ -217,7 +447,19 @@ bool RDNA4Driver::submitComputeCommands(const uint32_t* pm4Data, size_t dwordCou
         return false;
     }
 
+    if (submitLock) IOLockLock(submitLock);
+    const bool ok = submitComputeCommandsLocked(pm4Data, dwordCount);
+    if (submitLock) IOLockUnlock(submitLock);
+    return ok;
+}
+
+bool RDNA4Driver::submitComputeCommandsLocked(const uint32_t* pm4Data,
+                                              size_t dwordCount) {
     LOG("submitComputeCommands: submitting %zu dwords", dwordCount);
+
+    // Reclaim whatever the CP has already consumed before checking for space,
+    // otherwise the ring looks full after ~1 MiB of lifetime submissions.
+    refreshRingReadPtr();
 
     if (!computeRing->writePM4(pm4Data, dwordCount)) {
         LOG_ERROR("submitComputeCommands: failed to write PM4 to ring");
@@ -260,6 +502,15 @@ bool RDNA4Driver::submitComputeCommands(const uint32_t* pm4Data, size_t dwordCou
 
     LOG("submitComputeCommands: commands submitted successfully");
     return true;
+}
+
+uint64_t RDNA4Driver::allocFenceValue() {
+    return computeRing ? computeRing->allocateFence() : 0;
+}
+
+uint64_t RDNA4Driver::computeFenceGpuAddr() {
+    if (!computeRing) return 0;
+    return gmcContext.vramStart + computeRing->getFenceVRAMOffset();
 }
 
 bool RDNA4Driver::waitForComputeFence(uint64_t fenceValue, uint64_t timeoutMS) {

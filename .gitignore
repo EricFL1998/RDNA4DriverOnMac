@@ -8,7 +8,8 @@ tools/pico-login/build*/
 
 # Third-party references / large local artifacts (not part of the driver)
 navi48/
-navi48-native/
+navi48-native/*
+!navi48-native/metal-bundle/
 tools/dyld-inspect/
 tools/pico-login/
 dist/metal/

@@ -39,6 +39,9 @@ public:
     uint32_t getReadPointer() const { return readPtr; }
     bool isFull() const;
     bool isEmpty() const;
+
+    // Update the CP's read pointer so released ring space becomes reusable.
+    void setReadPointer(uint32_t rptr);
     
     // Get VRAM offsets
     uint64_t getFenceVRAMOffset() const { return fenceVRAMOffset; }

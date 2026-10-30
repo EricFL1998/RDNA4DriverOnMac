@@ -837,18 +837,26 @@ void RDNA4Driver::dumpComputeQueueState() {
         }
     }
 
-    if (vram && computeMqdGpuAddr >= gmcContext.vramStart) {
+    // The MQD lives either in the GART-mapped system buffer (map_legacy_kq
+    // convention) or in VRAM; pick the descriptor that actually backs it.
+    const volatile uint32_t* mqd = nullptr;
+    if (computeMqdMd) {
+        mqd = static_cast<const volatile uint32_t*>(computeMqdMd->getBytesNoCopy());
+    } else if (vram && computeMqdGpuAddr >= gmcContext.vramStart) {
         const uint64_t mqdOffset = computeMqdGpuAddr - gmcContext.vramStart;
         if (mqdOffset + 4 * 141 <= vramSize) {
-            const volatile uint32_t* mqd = reinterpret_cast<const volatile uint32_t*>(
+            mqd = reinterpret_cast<const volatile uint32_t*>(
                 const_cast<uint8_t*>(vram) + mqdOffset);
-            const uint64_t rptrAddr = (static_cast<uint64_t>(mqd[140]) << 32) | mqd[139];
-            if (rptrAddr >= gmcContext.vramStart &&
-                rptrAddr - gmcContext.vramStart + 4 <= vramSize) {
-                volatile uint32_t* report = reinterpret_cast<volatile uint32_t*>(
-                    const_cast<uint8_t*>(vram) + (rptrAddr - gmcContext.vramStart));
-                setProperty("Diag,RptrReport", static_cast<uint64_t>(*report), 32);
-            }
+        }
+    }
+    if (mqd) {
+        const uint64_t rptrAddr = (static_cast<uint64_t>(mqd[140]) << 32) | mqd[139];
+        setProperty("Diag,MqdRptrReportAddr", rptrAddr, 64);
+        if (vram && rptrAddr >= gmcContext.vramStart &&
+            rptrAddr - gmcContext.vramStart + 4 <= vramSize) {
+            volatile uint32_t* report = reinterpret_cast<volatile uint32_t*>(
+                const_cast<uint8_t*>(vram) + (rptrAddr - gmcContext.vramStart));
+            setProperty("Diag,RptrReport", static_cast<uint64_t>(*report), 32);
         }
     }
 

@@ -108,8 +108,20 @@ void ComputeRing::submit() {
     IOLog("ComputeRing: submitted - doorbell[%u] = %u\n", doorbellIndex, writePtr);
 }
 
-bool ComputeRing::waitForFence(uint64_t fenceValue, uint64_t timeoutMS) {
-    if (!fenceAddress) {
+// The CP publishes its consumed position through the MQD's rptr report address.
+// Without feeding it back the wrap-around check below would see the ring fill
+// up permanently after one megabyte of submissions.
+void ComputeRing::setReadPointer(uint32_t rptr) {
+    if (ringSize == 0) return;
+    if (rptr >= ringSize) {
+        // The CP reports a dword index inside the ring; anything else is a
+        // desynchronised queue and must not be trusted as free space.
+        return;
+    }
+    readPtr = rptr;
+}
+
+bool ComputeRing::waitForFence(uint64_t fenceValue, uint64_t timeoutMS) {    if (!fenceAddress) {
         IOLog("ComputeRing: fence address not initialized\n");
         return false;
     }

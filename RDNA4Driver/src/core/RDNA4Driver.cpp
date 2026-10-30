@@ -6,6 +6,7 @@
 //
 
 #include "RDNA4Driver.hpp"
+#include "RDNA4DriverUserClient.hpp"
 #include <IOKit/IOLib.h>
 #include <string.h>
 #include "../hardware/IPDiscovery.hpp"
@@ -119,6 +120,9 @@ bool RDNA4Driver::start(IOService* provider) {
     setProperty("BuildTimestamp", __DATE__ " " __TIME__);
     LOG_DEBUG(1, "Debug level: %u", debugLevel);
 
+    // Serialises PM4 submission; user-space and kernel-side tests share the ring.
+    if (!submitLock) submitLock = IOLockAlloc();
+
     // 读取设备信息
     if (!identifyDevice()) {
         LOG_ERROR("Device identification failed");
@@ -192,6 +196,42 @@ bool RDNA4Driver::start(IOService* provider) {
     return true;
 }
 
+IOReturn RDNA4Driver::newUserClient(task_t owningTask, void* securityID,
+                                       UInt32 type, IOUserClient** handler) {
+    if (!handler) return kIOReturnBadArgument;
+    *handler = nullptr;
+    (void)securityID;
+
+    // Only the compute interface is exposed; type is reserved for future
+    // splits (window mapping, profiling) and must be 0 today.
+    if (type != 0) return kIOReturnUnsupported;
+    if (!computeRing) {
+        LOG_ERROR("newUserClient: compute ring not initialized");
+        return kIOReturnNotReady;
+    }
+
+    RDNA4DriverUserClient* client = OSTypeAlloc(RDNA4DriverUserClient);
+    if (!client) return kIOReturnNoMemory;
+
+    if (!client->initWithTask(owningTask, securityID, type)) {
+        client->release();
+        return kIOReturnError;
+    }
+    if (!client->attach(this)) {
+        client->release();
+        return kIOReturnError;
+    }
+    if (!client->start(this)) {
+        client->detach(this);
+        client->release();
+        return kIOReturnError;
+    }
+
+    *handler = client;
+    LOG("newUserClient: compute user client created");
+    return kIOReturnSuccess;
+}
+
 void RDNA4Driver::releaseResources() {
     freeDiscovery();
     gmcFini(gmcContext);
@@ -202,6 +242,13 @@ void RDNA4Driver::releaseResources() {
         computeRing = nullptr;
     }
     computeHeapNext = 0;
+    userHeapNext = 0;
+    vramBlocksReset();
+
+    if (submitLock) {
+        IOLockFree(submitLock);
+        submitLock = nullptr;
+    }
     clearStateGpuAddr = 0;
     
     unmapBARs();
@@ -1730,11 +1777,18 @@ bool RDNA4Driver::testVectorAdd() {
     uint64_t bufferA = allocateVRAMBuffer(bufferSize);
     uint64_t bufferB = allocateVRAMBuffer(bufferSize);
     uint64_t bufferC = allocateVRAMBuffer(bufferSize);
-    uint64_t shaderBuffer = allocateVRAMBuffer(16 * 1024);  // 16KB for shader
+    constexpr size_t kShaderBufferBytes = 16 * 1024;
+    uint64_t shaderBuffer = allocateVRAMBuffer(kShaderBufferBytes);
     uint64_t kernargBuffer = allocateVRAMBuffer(4096);
-    
+
     if (!bufferA || !bufferB || !bufferC || !shaderBuffer || !kernargBuffer) {
         LOG_ERROR("testVectorAdd: buffer allocation failed");
+        return false;
+    }
+    if (g_vectorAddShaderSize > kShaderBufferBytes) {
+        // 拷贝循环没有边界保护，shader 一旦变大就会写穿到相邻的 VRAM 分配。
+        LOG_ERROR("testVectorAdd: shader blob %u bytes exceeds the %zu byte buffer",
+                  g_vectorAddShaderSize, kShaderBufferBytes);
         return false;
     }
     

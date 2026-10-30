@@ -22,6 +22,7 @@ RESOURCES = $(CONTENTS)/Resources
 # Source files
 CPP_SOURCES = $(SRC_DIR)/core/RDNA4Driver.cpp \
 	$(SRC_DIR)/core/ComputeSubmission.cpp \
+	$(SRC_DIR)/core/RDNA4DriverUserClient.cpp \
 	$(SRC_DIR)/hardware/IPDiscovery.cpp \
 		$(SRC_DIR)/hardware/PSPLoader.cpp \
 		$(SRC_DIR)/hardware/SMUMailbox.cpp \

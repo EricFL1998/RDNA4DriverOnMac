@@ -16,6 +16,7 @@ struct GMCContext {
     // Dummy page（用于页错误重定向和 GART 空表项）
     IOBufferMemoryDescriptor* dummyPage { nullptr };
     uint64_t dummyPagePhys { 0 };
+    bool dummyPagePrepared { false };
 
     // GART 页表位于 VRAM（VRAM 相对偏移），硬件只接受 GPU 可寻址地址
     uint64_t gartTableVramOffset { 0 };

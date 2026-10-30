@@ -39,6 +39,15 @@ constexpr uint64_t kComputeRingSize = 1ULL * kMiB;
 constexpr uint64_t kComputeFence    = kComputeRing + kComputeRingSize;
 constexpr uint64_t kComputeHeap     = 194ULL * kMiB;
 
+// Phase 3.3 user-visible window. This is the only VRAM range a user-space
+// client is allowed to map (IOUserClient::clientMemoryForType), so it sits far
+// above the kernel-side compute heap: PSP/GFX/GART and the kernel's own buffers
+// must never be reachable from user space.
+// BAR0 maps 256 MiB on this card, so the window has to live inside that.
+// It sits above the compute heap's ceiling, which allocateVRAMBuffer enforces.
+constexpr uint64_t kUserHeap     = 224ULL * kMiB;
+constexpr uint64_t kUserHeapSize = 32ULL * kMiB;
+
 } // namespace VramLayout
 
 #endif
