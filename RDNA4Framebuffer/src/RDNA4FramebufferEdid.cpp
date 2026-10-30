@@ -4,6 +4,7 @@
 //
 
 #include "RDNA4FramebufferEdid.hpp"
+#include "RDNA4FramebufferAux.hpp"
 #include <IOKit/IOLib.h>
 #include <string.h>
 
@@ -94,27 +95,34 @@ struct Plan {
 };
 
 struct Env {
-    volatile uint32_t* mmio;
-    uint64_t mmioBytes;
+    const RDNA4FBEdidAccess& access;
     bool writeFailed;
-    bool canAccess(uint32_t baseIdx, uint32_t off) const {
-        const uint64_t index = (baseIdx == 2u ? kSeg2 : kSeg1) + static_cast<uint64_t>(off);
-        return mmio && index < mmioBytes / sizeof(uint32_t);
-    }
     uint32_t rd(uint32_t baseIdx, uint32_t off) {
-        if (!canAccess(baseIdx, off)) return 0xFFFFFFFFu;
         const uint32_t base = baseIdx == 2u ? kSeg2 : kSeg1;
-        return mmio[base + off];
+        return access.read(access.context, base + off);
     }
     void wr2(uint32_t off, uint32_t v) {
-        if (!canAccess(2u, off)) {
-            writeFailed = true;
-            return;
-        }
-        mmio[kSeg2 + off] = v;
+        access.write(access.context, kSeg2 + off, v);
     }
     void delayUs(uint32_t us) { IODelay(us); }
 };
+
+struct MmioAccess {
+    volatile uint32_t* mmio;
+    uint64_t mmioBytes;
+};
+
+uint32_t mmioRead(void* context, uint32_t dword) {
+    const auto* m = static_cast<const MmioAccess*>(context);
+    if (!m->mmio || dword >= m->mmioBytes / sizeof(uint32_t)) return 0xFFFFFFFFu;
+    return m->mmio[dword];
+}
+
+void mmioWrite(void* context, uint32_t dword, uint32_t value) {
+    auto* m = static_cast<MmioAccess*>(context);
+    if (!m->mmio || dword >= m->mmioBytes / sizeof(uint32_t)) return;
+    m->mmio[dword] = value;
+}
 
 uint32_t arbEntry(uint32_t arb) {
     if (arb == 0xFFFFFFFFu) return kEngineDead;
@@ -182,6 +190,7 @@ uint32_t i2cXfer(Env& e, uint32_t line, const Plan& p, uint8_t out[kEdidBlock]) 
     const uint32_t rSpeed = kI2cDdc1Speed + 2u * line;
 
     uint32_t arb = e.rd(2u, kI2cArbitration);
+    IOLog("RDNA4Framebuffer: DDC%u entry arb=0x%08x\n", line, arb);
     uint32_t v = arbEntry(arb);
     if (v != kOk) return v;
 
@@ -198,6 +207,7 @@ uint32_t i2cXfer(Env& e, uint32_t line, const Plan& p, uint8_t out[kEdidBlock]) 
     if (v != kOk) return v;
     e.wr2(kI2cArbitration, arb | kArbSwUseReq);
     arb = e.rd(2u, kI2cArbitration);
+    IOLog("RDNA4Framebuffer: DDC%u granted arb=0x%08x\n", line, arb);
     if (!arbGranted(arb)) {
         e.wr2(kI2cArbitration, e.rd(2u, kI2cArbitration) | kArbSwDoneUsing);
         return kNotGranted;
@@ -211,6 +221,7 @@ uint32_t i2cXfer(Env& e, uint32_t line, const Plan& p, uint8_t out[kEdidBlock]) 
               (e.rd(2u, kI2cArbitration) | kArbSwUseReq) & ~kArbNoQueuedSwGo);
 
         const uint32_t mtb = e.rd(1u, kMicrosecondTimeBaseDiv);
+        IOLog("RDNA4Framebuffer: DDC%u timebase=0x%08x\n", line, mtb);
         const uint32_t refBase = mtb & 0x7Fu;
         uint32_t xtalDiv = (mtb >> 8) & 0x7Fu;
         if (mtb != 0xFFFFFFFFu && refBase != 0u) {
@@ -232,8 +243,14 @@ uint32_t i2cXfer(Env& e, uint32_t line, const Plan& p, uint8_t out[kEdidBlock]) 
 
         bool finished = false;
         for (uint32_t i = 0; i < p.ntxn * kDdcPollPerTxn; i++) {
-            const int vd = swStatusVerdict(e.rd(2u, kI2cSwStatus));
-            if (vd > 0) { status = static_cast<uint32_t>(vd); finished = true; break; }
+            const uint32_t sw = e.rd(2u, kI2cSwStatus);
+            const int vd = swStatusVerdict(sw);
+            if (vd > 0) {
+                IOLog("RDNA4Framebuffer: DDC%u sw_status=0x%08x polls=%u\n", line, sw, i + 1);
+                status = static_cast<uint32_t>(vd);
+                finished = true;
+                break;
+            }
             if (vd == 0) { finished = true; break; }
             e.delayUs(kDdcPollStepUs);
         }
@@ -249,6 +266,8 @@ uint32_t i2cXfer(Env& e, uint32_t line, const Plan& p, uint8_t out[kEdidBlock]) 
     e.wr2(kI2cControl, kCtlSoftReset | kCtlSwStatusReset);
     e.wr2(rSetup, 0u);
     e.wr2(kI2cArbitration, e.rd(2u, kI2cArbitration) | kArbSwDoneUsing);
+    IOLog("RDNA4Framebuffer: DDC%u release arb=0x%08x status=%u\n",
+          line, e.rd(2u, kI2cArbitration), status);
     if (e.writeFailed && status == kOk) status = kEngineDead;
     return status;
 }
@@ -266,12 +285,26 @@ uint32_t edidSum(const uint8_t* b) {
 
 } // namespace
 
-bool rdna4fbReadEdid(volatile uint32_t* mmio, uint64_t mmioBytes,
-                     uint8_t edid[256], uint32_t* length, uint32_t* line) {
-    constexpr uint64_t requiredDwords = kSeg2 + kDioMemPwrCtrl + 1u;
-    if (!mmio || !edid || !length || !line ||
-        mmioBytes < requiredDwords * sizeof(uint32_t)) return false;
-    Env env { mmio, mmioBytes, false };
+bool rdna4fbReadEdidWithAccess(const RDNA4FBEdidAccess& access,
+                               uint8_t edid[256], uint32_t* length, uint32_t* line) {
+    if (!access.read || !access.write || !edid || !length || !line) return false;
+    for (uint32_t instance = 0; instance <= 1u; ++instance) {
+        if (!rdna4fbAuxReadBlockWithAccess(access, instance, 0, edid)) continue;
+        if (!edidHeaderOk(edid) || edidSum(edid) != 0u) {
+            IOLog("RDNA4Framebuffer: AUX%u returned an invalid EDID base block\n", instance);
+            continue;
+        }
+        *line = instance;
+        *length = kEdidBlock;
+        if (edid[126] != 0u && rdna4fbAuxReadBlockWithAccess(access, instance, 128, edid + 128) &&
+            edidSum(edid + 128) == 0u) {
+            *length = 2u * kEdidBlock;
+        }
+        IOLog("RDNA4Framebuffer: EDID read on AUX%u (%u bytes)\n", instance, *length);
+        return true;
+    }
+
+    Env env { access, false };
     for (uint32_t ln = 2u; ln <= 3u; ln++) {
         Plan plan;
         if (planDdc(0, &plan) != kOk) return false;
@@ -302,4 +335,21 @@ bool rdna4fbReadEdid(volatile uint32_t* mmio, uint64_t mmioBytes,
         return true;
     }
     return false;
+}
+
+bool rdna4fbReadEdid(volatile uint32_t* mmio, uint64_t mmioBytes,
+                     uint8_t edid[256], uint32_t* length, uint32_t* line) {
+    MmioAccess context { mmio, mmioBytes };
+    const RDNA4FBEdidAccess access { &context, mmioRead, mmioWrite };
+    return rdna4fbReadEdidWithAccess(access, edid, length, line);
+}
+
+bool rdna4fbReadEdidBlock(const uint8_t* edid, uint32_t edidLength,
+                          uint32_t blockNumber, uint8_t* data, uint64_t* length) {
+    if (!edid || !data || !length || blockNumber == 0u ||
+        blockNumber > edidLength / kEdidBlock || edidLength % kEdidBlock != 0u) return false;
+    const uint64_t count = *length < kEdidBlock ? *length : kEdidBlock;
+    memcpy(data, edid + (blockNumber - 1u) * kEdidBlock, count);
+    *length = count;
+    return true;
 }

@@ -21,6 +21,10 @@ public:
     IOReturn enableController() override;
     bool isConsoleDevice() override;
     IOItemCount getConnectionCount() override;
+    bool hasDDCConnect(IOIndex connectIndex) override;
+    IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
+                         IOSelect blockType, IOOptionBits options,
+                         UInt8* data, IOByteCount* length) override;
     IOReturn getAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
                                        uintptr_t* value) override;
     IOReturn getPixelInformation(IODisplayModeID displayMode, IOIndex depth,
@@ -50,6 +54,8 @@ private:
     uint32_t fbHeight { 0 };
     uint32_t fbRowBytes { 0 };
     uint32_t fbDepth { 32 };
+    uint8_t edidData[256] {};
+    uint32_t edidLength { 0 };
 };
 
 OSDefineMetaClassAndStructors(RDNA4Framebuffer, IOFramebuffer)
@@ -175,9 +181,7 @@ bool RDNA4Framebuffer::start(IOService* provider) {
     pci->setProperty("model", deviceModel);
     setProperty("model", deviceModel);
 
-    // The display's own name comes from its EDID, read over the display
-    // engine's I2C bus.  A failure here is non-fatal: the console framebuffer
-    // keeps working, macOS just shows a generic display name.
+    // A failure here is non-fatal: the console framebuffer keeps working.
     if (IOMemoryMap* bar5 = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5)) {
         volatile uint32_t* mmio =
             reinterpret_cast<volatile uint32_t*>(bar5->getVirtualAddress());
@@ -185,13 +189,15 @@ bool RDNA4Framebuffer::start(IOService* provider) {
         uint8_t edid[256];
         uint32_t edidLen = 0, ddcLine = 0;
         if (mmio && mmioBytes && rdna4fbReadEdid(mmio, mmioBytes, edid, &edidLen, &ddcLine)) {
+            memcpy(edidData, edid, edidLen);
+            edidLength = edidLen;
             if (OSData* d = OSData::withBytes(edid, edidLen)) {
                 setProperty("IODisplayEDID", d);
                 d->release();
             }
             if (OSData* d = OSData::withBytes(edid, 128)) {
                 char key[24];
-                snprintf(key, sizeof(key), "EDID,DDC%u", ddcLine);
+                snprintf(key, sizeof(key), "EDID,%s%u", ddcLine < 2u ? "AUX" : "DDC", ddcLine);
                 setProperty(key, d);
                 d->release();
             }
@@ -304,6 +310,21 @@ IOItemCount RDNA4Framebuffer::getConnectionCount() {
     return 1;
 }
 
+bool RDNA4Framebuffer::hasDDCConnect(IOIndex connectIndex) {
+    return connectIndex == 0 && edidLength != 0;
+}
+
+IOReturn RDNA4Framebuffer::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
+                                       IOSelect blockType, IOOptionBits options,
+                                       UInt8* data, IOByteCount* length) {
+    (void)options;
+    if (connectIndex != 0 || blockType != kIODDCBlockTypeEDID || !data || !length)
+        return kIOReturnUnsupported;
+    if (blockNumber == 0 || blockNumber > edidLength / 128u) return kIOReturnNotFound;
+    return rdna4fbReadEdidBlock(edidData, edidLength, blockNumber, data, length)
+           ? kIOReturnSuccess : kIOReturnNotFound;
+}
+
 IOReturn RDNA4Framebuffer::getAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
                                                     uintptr_t* value) {
     switch (attribute) {
@@ -314,6 +335,8 @@ IOReturn RDNA4Framebuffer::getAttributeForConnection(IOIndex connectIndex, IOSel
         case kConnectionFlags:
             if (value) *value = 0;
             return kIOReturnSuccess;
+        case kConnectionSupportsHLDDCSense:
+            return edidLength ? kIOReturnSuccess : kIOReturnUnsupported;
         default:
             return IOFramebuffer::getAttributeForConnection(connectIndex, attribute, value);
     }
