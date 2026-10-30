@@ -31,7 +31,9 @@ OBJC_OBJECTS = $(OBJC_SOURCES:$(SRC_DIR)/%.m=$(BUILD_DIR)/%.o)
 
 # Compiler
 CC = clang
-CFLAGS = -Wall -Wextra -std=c11 -O2 \
+ARCH ?= x86_64
+
+CFLAGS = -Wall -Wextra -std=c11 -O2 -arch $(ARCH) \
 	-framework Foundation \
 	-framework Metal \
 	-framework IOKit \

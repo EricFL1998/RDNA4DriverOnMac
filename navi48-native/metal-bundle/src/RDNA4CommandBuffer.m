@@ -84,6 +84,16 @@
 }
 
 - (void)submitToGPU {
+    // An empty command buffer completes immediately: Metal callers commit
+    // buffers without encoders and expect success, and the driver correctly
+    // refuses a zero-length submission.
+    if (_allCommands.length == 0) {
+        _status = MTLCommandBufferStatusScheduled;
+        _status = MTLCommandBufferStatusCompleted;
+        [self notifyCompletion];
+        return;
+    }
+
     RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
     if (!link) {
         NSLog(@"RDNA4CommandBuffer: RDNA4Driver service is not available");
