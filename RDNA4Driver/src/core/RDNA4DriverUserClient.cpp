@@ -238,25 +238,10 @@ IOReturn RDNA4DriverUserClient::sSubmitGraphics(OSObject* target, void* referenc
     const auto* pm4 = static_cast<const uint32_t*>(arguments->structureInput);
     const size_t dwords = bytes / 4;
 
-    // The driver owns the fence counter: a user-space value would never match
-    // the slot the GPU writes.
-    const uint64_t fence = self->driver->allocGraphicsFence();
-    const uint64_t fenceAddr = self->driver->graphicsFenceGpuAddr();
-    if (!fenceAddr) return kIOReturnNotReady;
-
-    PM4BuilderKernel fencePacket;
-    fencePacket.emitFenceWrite(fenceAddr, fence);
-    const size_t fenceDwords = fencePacket.getPacketCount();
-
-    const size_t totalDwords = dwords + fenceDwords;
-    uint32_t* stream = static_cast<uint32_t*>(IOMalloc(totalDwords * sizeof(uint32_t)));
-    if (!stream) return kIOReturnNoMemory;
-    for (size_t i = 0; i < dwords; i++) stream[i] = pm4[i];
-    for (size_t i = 0; i < fenceDwords; i++) stream[dwords + i] = fencePacket.getPackets()[i];
-
-    const bool submitted = self->driver->submitGraphicsCommands(stream, totalDwords);
-    IOFree(stream, totalDwords * sizeof(uint32_t));
-    if (!submitted) return kIOReturnNoResources;
+    uint64_t fence = 0;
+    if (!self->driver->submitGraphicsCommands(pm4, dwords, &fence)) {
+        return kIOReturnNoResources;
+    }
 
     arguments->scalarOutput[0] = fence;
     return kIOReturnSuccess;

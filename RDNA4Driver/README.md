@@ -43,7 +43,19 @@ plutil -lint build/RDNA4Driver.kext/Contents/Info.plist
 
 输出：`build/RDNA4Driver.kext` (x86_64)。
 
+主机侧单元测试（不需要硬件，不需要 IOKit）：
+
+```bash
+make test-pm4
+```
+
+依次跑 `tests/test_graphics_pm4.cpp`（PM4 编码器）、`tests/test_mes_api.cpp`（MES ADD_QUEUE 帧的 dword 布局、CP_GFX_HQD 寄存器 segment、doorbell 窗口编码）和 `tests/test_graphics_ring.cpp`（GFX ring 门铃落在 `index*4` 字节）。`tests/host-shim/` 里是让内核类在主机编译的最小 IOLib 替身。
+
 当前仍有两个既有编译警告：参数 shadow 和整数精度转换。
+
+## 部署到测试机
+
+这台机器上 `kmutil load -p` 总是返回 "not approved"，`kmutil install --update-all` 因系统卷只读失败；AuxKC 只在重启时由 kernelmanagerd 重建，而且**只有 bundle 路径变了才会重建**。所以每个新版本装到一个新目录（例如 `/Library/Extensions/RDNA4Driver-0.8.6.kext`），把旧目录移走，做一次会被拒绝的 `kmutil load -p`，然后重启。boot-args 由 OpenCore 的 `config.plist` 决定（`nvram boot-args=` 会被拒绝）。
 
 ## 安装
 
@@ -80,6 +92,8 @@ rdna4=1 rdna4-debug=2 rdna4-psp=1 rdna4-smu=1 rdna4-gfx=1 rdna4-mes-gtt=1 rdna4-
 | `rdna4-queue=1` | 非 MES 路径下直接激活 HQD（仅调试） |
 | `rdna4-mes-hwr1=1` | 对 SCHED pipe 也发 SET_HW_RESOURCES_1（固件 ≥0x4B，仅调试） |
 | `rdna4-mes-gtt=1` | MQD/wptr 放在 GART 系统内存而非 VRAM（上游 KFD/MES 约定） |
+| `rdna4-mes-log=1` | 把 MES 事件日志页交给固件（默认关闭，与上游 `disable_mes_log=1` 一致） |
+| `rdna4-gfx-queue=1` | 让 MES 映射内核 GFX 队列（默认关闭，仅调试；是否可执行以 GFX fence 和 HQD 状态为准，不能只看 ADD_QUEUE ACK） |
 | `rdna4-compute-test=1` | 启动时跑 vectorAdd，结果在 `ioreg -r -n RDNA4Driver` 的 `ComputeTest,*` 和内核日志 |
 | `rdna4-compute-test=2` | 额外跑逐包探针（每个 SET_SH_REG 单独 IB+fence，`ComputeTest,StepStuckAt`）和 Cobalt64 store_magic 对照着色器（`ComputeTest,Ctrl*`、`ComputeTest,Sh*`） |
 

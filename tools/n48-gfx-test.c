@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <IOKit/IOKitLib.h>
 
 enum {
@@ -32,6 +34,111 @@ static int failures;
 static void check(const char* what, int ok, const char* detail) {
     printf("  %s %-42s %s\n", ok ? "ok  " : "FAIL", what, detail ? detail : "");
     if (!ok) failures++;
+}
+
+static int concurrentWorker(int id) {
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                   IOServiceMatching("RDNA4Driver"));
+    if (!svc) return 1;
+    io_connect_t conn = 0;
+    if (IOServiceOpen(svc, mach_task_self(), 0, &conn) != KERN_SUCCESS) {
+        IOObjectRelease(svc);
+        return 1;
+    }
+    IOObjectRelease(svc);
+
+    uint64_t dev[4] = {0, 0, 0, 0};
+    uint32_t outCount = 4;
+    if (IOConnectCallMethod(conn, kSelGetDeviceInfo, NULL, 0, NULL, 0,
+                            dev, &outCount, NULL, NULL) != KERN_SUCCESS) {
+        IOServiceClose(conn);
+        return 1;
+    }
+    mach_vm_address_t mapped = 0;
+    mach_vm_size_t mappedSize = 0;
+    if (IOConnectMapMemory64(conn, kMemTypeWindow, mach_task_self(), &mapped, &mappedSize,
+                             kIOMapAnywhere) != KERN_SUCCESS) {
+        IOServiceClose(conn);
+        return 1;
+    }
+    uint64_t size = 4096, gpuAddr = 0;
+    outCount = 1;
+    if (IOConnectCallMethod(conn, kSelAllocateBuffer, &size, 1, NULL, 0,
+                            &gpuAddr, &outCount, NULL, NULL) != KERN_SUCCESS) {
+        IOServiceClose(conn);
+        return 1;
+    }
+    volatile uint32_t* words =
+        (volatile uint32_t*)((uint8_t*)mapped + (gpuAddr - dev[2]));
+    int bad = 0;
+    for (uint32_t i = 0; i < 25; i++) {
+        const uint32_t magic0 = 0x60000000u + ((uint32_t)id << 16) + i * 2;
+        const uint32_t magic1 = magic0 + 1;
+        words[0] = words[1] = 0;
+        enum { kPadDwords = 1000 };
+        uint32_t pm4[kPadDwords + 10];
+        for (uint32_t j = 0; j < kPadDwords; j++) pm4[j] = 0xFFFF1000u;
+        const uint32_t packets[10] = {
+            (3u << 30) | (3u << 16) | (0x37u << 8),
+            (1u << 30) | (5u << 8) | (1u << 20),
+            (uint32_t)(gpuAddr & 0xFFFFFFFCu), (uint32_t)(gpuAddr >> 32), magic0,
+            (3u << 30) | (3u << 16) | (0x37u << 8),
+            (1u << 30) | (5u << 8) | (1u << 20),
+            (uint32_t)((gpuAddr + 4) & 0xFFFFFFFCu),
+            (uint32_t)((gpuAddr + 4) >> 32), magic1,
+        };
+        memcpy(pm4 + kPadDwords, packets, sizeof(packets));
+        uint64_t fence = 0;
+        uint32_t fenceCount = 1;
+        kern_return_t kr = IOConnectCallMethod(conn, kSelSubmitGraphics, NULL, 0,
+                                               pm4, sizeof(pm4), &fence, &fenceCount,
+                                               NULL, NULL);
+        uint64_t wait[2] = { fence, 5000 };
+        if (kr == KERN_SUCCESS) {
+            kr = IOConnectCallMethod(conn, kSelWaitGraphicsFence, wait, 2, NULL, 0,
+                                     NULL, NULL, NULL, NULL);
+        }
+        if (kr != KERN_SUCCESS || words[0] != magic0 || words[1] != magic1) bad++;
+    }
+    uint64_t freeAddr = gpuAddr;
+    IOConnectCallMethod(conn, kSelFreeBuffer, &freeAddr, 1, NULL, 0,
+                        NULL, NULL, NULL, NULL);
+    IOServiceClose(conn);
+    return bad;
+}
+
+static void testConcurrentClients(void) {
+    enum { kClients = 8 };
+    int gate[2];
+    pid_t pids[kClients];
+    if (pipe(gate) != 0) {
+        check("create concurrent start gate", 0, "");
+        return;
+    }
+    for (int i = 0; i < kClients; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) {
+            char token;
+            close(gate[1]);
+            if (read(gate[0], &token, 1) != 1) _exit(127);
+            close(gate[0]);
+            _exit(concurrentWorker(i));
+        }
+    }
+    close(gate[0]);
+    const char tokens[kClients] = {0};
+    (void)write(gate[1], tokens, sizeof(tokens));
+    close(gate[1]);
+    int bad = 0;
+    for (int i = 0; i < kClients; i++) {
+        int status = 0;
+        if (pids[i] > 0 && waitpid(pids[i], &status, 0) == pids[i] &&
+            WIFEXITED(status)) bad += WEXITSTATUS(status);
+        else bad++;
+    }
+    char detail[64];
+    snprintf(detail, sizeof detail, "%d failed submissions", bad);
+    check("8 concurrent clients x 25 fenced writes", bad == 0, detail);
 }
 
 int main(void) {
@@ -138,6 +245,7 @@ int main(void) {
     IOConnectCallMethod(conn, kSelFreeBuffer, &freeAddr, 1, NULL, 0, NULL, NULL, NULL, NULL);
     IOServiceClose(conn);
 
+    if (failures == 0) testConcurrentClients();
     printf("\nRESULT: %s (%d failures)\n", failures ? "FAILURES" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

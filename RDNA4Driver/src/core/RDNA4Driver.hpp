@@ -15,6 +15,7 @@
 #include "../hardware/IPDiscovery.hpp"
 #include "../hardware/PSPLoader.hpp"
 #include "../hardware/GMCContext.hpp"
+#include "../hardware/MesApi.hpp"
 #include "../hardware/ComputeRing.hpp"
 #include "../hardware/GraphicsRing.hpp"
 
@@ -154,6 +155,8 @@ private:
     uint64_t mesWptrGpuAddr[2] { 0, 0 };
     uint32_t mesDoorbellIndex[2] { 0, 0 };
     uint64_t mesStatusGpuAddr { 0 };
+    uint32_t mesFenceSeq { 0 };
+    bool mesTimedOut { false };
     // MES ring/MQD/EOP/status live in system memory mapped through the GART
     // aperture, like every mes_v12_0_mqd_sw_init/amdgpu_ring_init allocation.
     // CPU access goes through these descriptors, never through the BAR0 window.
@@ -168,10 +171,10 @@ private:
     volatile uint8_t* mesBufferCpu(IOBufferMemoryDescriptor* md, uint64_t gpuAddr);
     // SET_HW_RESOURCES carries a scheduler context and a status fence that MES
     // writes into; both must be GART-mapped system memory.
-    uint64_t mesSchCtxGpuAddr { 0 };
-    uint64_t mesStatusFenceGpuAddr { 0 };
-    IOBufferMemoryDescriptor* mesSchCtxMd { nullptr };
-    IOBufferMemoryDescriptor* mesStatusFenceMd { nullptr };
+    uint64_t mesSchCtxGpuAddr[2] { 0, 0 };
+    uint64_t mesStatusFenceGpuAddr[2] { 0, 0 };
+    IOBufferMemoryDescriptor* mesSchCtxMd[2] { nullptr, nullptr };
+    IOBufferMemoryDescriptor* mesStatusFenceMd[2] { nullptr, nullptr };
     bool mesSetHwResources(uint32_t pipe);
     // sched_version >= 0x4b also requires SET_HW_RESOURCES_1, which hands MES
     // the cleaner-shader fence page and the KIQ unmap timeout.
@@ -201,13 +204,18 @@ private:
     // ---- 图形队列状态 ----
     GraphicsRing* graphicsRing { nullptr };
     IOBufferMemoryDescriptor* graphicsMqdMd { nullptr };
+    // GART-backed GFX ring for the non-MES path (upstream keeps it in GTT).
+    IOBufferMemoryDescriptor* gfxRingMd { nullptr };
     IOBufferMemoryDescriptor* graphicsWptrMd { nullptr };
     uint64_t graphicsRingGpuAddr { 0 };
     uint64_t graphicsWptrGpuAddr { 0 };
     uint64_t graphicsRptrGpuAddr { 0 };
-    // 0x20 belongs to the compute queue on this card, so the GFX ring takes
-    // the next free dword slot.
-    uint32_t graphicsDoorbellIndex { 0x40 };
+    // gfx_ring0 of the kernel doorbell map, as a DWORD index (0x8B << 1):
+    // this is the value the MQD's DOORBELL_OFFSET and the BAR2 write use, and
+    // byte 0x116*4 == 0x458 is exactly CP_RB_DOORBELL_RANGE_LOWER.  The map
+    // entry 0x8B itself is a 64-bit slot and would ring byte 0x22c, outside
+    // the window (that shipped in 0.8.3 and the CP dropped every kick).
+    uint32_t graphicsDoorbellIndex { MesApi::Doorbell::kGfxRingDword };
     bool graphicsQueueMapped { false };
     IOLock* graphicsLock { nullptr };
     uint32_t graphicsRbBufsz { 0 };
@@ -223,6 +231,10 @@ private:
     bool writeGcRegister(uint32_t regDwordOffset, uint32_t value, uint8_t segment = 0);
     void grbmSelect(uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid);
     void dumpComputeQueueState();
+    // Publish "<prefix>,MqdDiffCount" and "<prefix>,MqdDiff" (dword index /
+    // before / after triples) for every dword the firmware changed.
+    void exportMqdDiff(const char* prefix, const uint32_t* before,
+                       const volatile uint32_t* after, uint32_t dwords);
     void programMecStartAddress();
 
     //==========================================================================
@@ -252,6 +264,7 @@ private:
     bool readBasicInfo();
 
     // 资源清理（stop/free/start 失败共用，必须幂等）
+    void releaseGartBuffers();
     void releaseResources();
     bool isPspAlive();
 
@@ -337,9 +350,10 @@ public:
     // MES 把 GFX pipe0/queue0 映射到我们的 ring 上（map_legacy_kq），
     // 之后所有绘制命令都走这条队列。
     bool initGraphicsRing();
-    bool submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCount);
+    void snapshotGraphicsQueue(const char* stage);
+    bool submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCount,
+                                uint64_t* fenceOut);
     bool waitForGraphicsFence(uint64_t fenceValue, uint64_t timeoutMS);
-    uint64_t allocGraphicsFence();
     uint64_t graphicsFenceGpuAddr();
     bool graphicsQueueReady() const { return graphicsQueueMapped; }
 

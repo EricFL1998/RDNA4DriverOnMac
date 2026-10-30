@@ -19,7 +19,7 @@ public:
     ~GraphicsRing();
 
     bool init(volatile uint8_t* vramBase, size_t vramSize,
-              volatile uint64_t* doorbellBase, uint32_t dbIndex,
+              volatile uint32_t* doorbellBase, uint32_t dbIndex,
               uint64_t ringVramOffset, uint64_t ringBytes,
               uint64_t fenceVramOffset);
 
@@ -38,7 +38,7 @@ public:
 private:
     volatile uint32_t* ring { nullptr };
     volatile uint64_t* fence { nullptr };
-    volatile uint64_t* doorbell { nullptr };
+    volatile uint32_t* doorbell { nullptr };
 
     uint32_t doorbellIndex { 0 };
     size_t ringSizeDwords { 0 };

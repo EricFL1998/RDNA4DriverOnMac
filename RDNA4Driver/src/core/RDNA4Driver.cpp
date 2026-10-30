@@ -12,6 +12,7 @@
 #include "../hardware/IPDiscovery.hpp"
 #include "../hardware/VramLayout.hpp"
 #include "../hardware/NBIODoorbell.hpp"
+#include "../hardware/GARTUtils.hpp"
 #include "psp_14_0_3_sos_fw.h"
 #include "../hardware/SMUMailbox.hpp"
 #include "../hardware/GFXFirmware.hpp"
@@ -122,6 +123,12 @@ bool RDNA4Driver::start(IOService* provider) {
 
     // Serialises PM4 submission; user-space and kernel-side tests share the ring.
     if (!submitLock) submitLock = IOLockAlloc();
+    if (!graphicsLock) graphicsLock = IOLockAlloc();
+    if (!submitLock || !graphicsLock) {
+        LOG_ERROR("Failed to allocate submission locks");
+        releaseResources();
+        return false;
+    }
 
     // 读取设备信息
     if (!identifyDevice()) {
@@ -180,9 +187,9 @@ bool RDNA4Driver::start(IOService* provider) {
     }
 
     // 图形 (GFX) 队列默认关闭，用 rdna4-gfx-queue=1 开启。
-    // 本机 MES 固件的实测结论：带 map_legacy_kq 的 ADD_QUEUE 会被直接拒绝；
-    // 不带时只 ack、不下发 GFX HQD（HQD_ACTIVE 恒为 0），而且会顶掉同槽的
-    // compute 队列。要跑通需要补 MES 进程上下文（ADD_PROCESS + 页表）。
+    // 参考的 async GFX 路径是 MQD -> MES ADD_QUEUE(map_legacy_kq) ->
+    // CP_MAX_CONTEXT / CP_DEVICE_ID，不预先编程 CP_RB0。ADD_QUEUE 的完成
+    // fence 只证明固件处理了请求；是否可执行仍以 HQD 和 GFX fence 为准。
     uint32_t gfxQueueEnable = 0;
     (void)PE_parse_boot_argn("rdna4-gfx-queue", &gfxQueueEnable, sizeof(gfxQueueEnable));
     if (gfxQueueEnable != 0) {
@@ -244,7 +251,28 @@ IOReturn RDNA4Driver::newUserClient(task_t owningTask, void* securityID,
     return kIOReturnSuccess;
 }
 
+void RDNA4Driver::releaseGartBuffers() {
+    graphicsQueueMapped = false;
+    computeQueueViaMes = false;
+    gmcUnmapGartBuffers(*this, gmcContext);
+    for (uint32_t pipe = 0; pipe < 2; pipe++) {
+        gmcReleaseGartBuffer(&mesRingMd[pipe]);
+        gmcReleaseGartBuffer(&mesMqdMd[pipe]);
+        gmcReleaseGartBuffer(&mesEopMd[pipe]);
+        gmcReleaseGartBuffer(&mesWpMd[pipe]);
+        gmcReleaseGartBuffer(&mesSchCtxMd[pipe]);
+        gmcReleaseGartBuffer(&mesStatusFenceMd[pipe]);
+    }
+    gmcReleaseGartBuffer(&mesStatusMd);
+    gmcReleaseGartBuffer(&computeWptrMd);
+    gmcReleaseGartBuffer(&computeMqdMd);
+    gmcReleaseGartBuffer(&gfxRingMd);
+    gmcReleaseGartBuffer(&graphicsMqdMd);
+    gmcReleaseGartBuffer(&graphicsWptrMd);
+}
+
 void RDNA4Driver::releaseResources() {
+    releaseGartBuffers();
     freeDiscovery();
     gmcFini(gmcContext);
     
@@ -266,6 +294,10 @@ void RDNA4Driver::releaseResources() {
     if (submitLock) {
         IOLockFree(submitLock);
         submitLock = nullptr;
+    }
+    if (graphicsLock) {
+        IOLockFree(graphicsLock);
+        graphicsLock = nullptr;
     }
     clearStateGpuAddr = 0;
     
@@ -315,6 +347,8 @@ bool RDNA4Driver::identifyDevice() {
     subsysDeviceID = (subsys >> 16) & 0xFFFF;
 
     deviceName = getDeviceNameForID(deviceID);
+    // Published for the framebuffer, which reports it to system_profiler.
+    if (deviceName) setProperty("Device,Name", deviceName);
 
     LOG_DEBUG(2, "Vendor ID: 0x%04x", vendorID);
     LOG_DEBUG(2, "Device ID: 0x%04x", deviceID);

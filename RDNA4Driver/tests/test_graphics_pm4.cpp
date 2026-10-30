@@ -79,13 +79,25 @@ static void testSequencePacket() {
     check(b.setViewport(0, 0, 640, 480, 0, 1), "setViewport accepted");
     size_t n = 0;
     p = b.getPackets(&n);
-    checkEq(static_cast<uint32_t>(n), 8, "viewport is one 8-dword packet");
-    checkEq(p[0], header(GFX12::PKT3_SET_CONTEXT_REG, 7), "viewport header covers 6 values");
+    checkEq(static_cast<uint32_t>(n), 10, "viewport is one 10-dword packet");
+    checkEq(p[0], header(GFX12::PKT3_SET_CONTEXT_REG, 9), "viewport header covers 8 values");
     checkEq(p[1], 0x10fu, "viewport starts at PA_CL_VPORT_XSCALE");
     checkEq(p[2], 0x43a00000u, "xscale = 320.0");
     checkEq(p[3], 0x43a00000u, "xoffset = 320.0");
     checkEq(p[4], 0xc3700000u, "yscale = -240.0 (Metal Y-down)");
     checkEq(p[5], 0x43700000u, "yoffset = 240.0");
+    checkEq(p[6], 0x3f800000u, "Metal zscale = far - near = 1");
+    checkEq(p[7], 0u, "Metal zoffset = near = 0");
+    checkEq(p[8], 0u, "PA_SC_VPORT_ZMIN_0 = 0");
+    checkEq(p[9], 0x3f800000u, "PA_SC_VPORT_ZMAX_0 = 1");
+
+    b.reset();
+    check(b.setViewport(0, 0, 640, 480, 0.2f, 0.8f), "custom depth viewport accepted");
+    p = b.getPackets(nullptr);
+    checkEq(p[6], 0x3f19999au, "custom zscale = 0.8 - 0.2");
+    checkEq(p[7], 0x3e4ccccdu, "custom zoffset = 0.2");
+    checkEq(p[8], 0x3e4ccccdu, "custom ZMIN = 0.2");
+    checkEq(p[9], 0x3f4ccccdu, "custom ZMAX = 0.8");
 
     b.reset();
     const uint32_t two[2] = { 1, 2 };
@@ -190,7 +202,7 @@ static void testRenderTargetAndState() {
     checkEq(p[8], 0u, "no MSAA, no force-alpha");
 
     checkEq(p[10], 0x31eu, "CB_COLOR0_ATTRIB2 offset");
-    checkEq(p[11], (640u << 16) | 480u, "ATTRIB2 = width << 16 | height");
+    checkEq(p[11], (639u << 16) | 479u, "ATTRIB2 = (width-1) << 16 | (height-1)");
 
     checkEq(p[13], 0x3b0u, "CB_COLOR0_INFO offset");
     checkEq(p[14], GFX12::CB_FORMAT_8_8_8_8_UNORM, "color format");
@@ -199,6 +211,27 @@ static void testRenderTargetAndState() {
     check(!b.setColorAttachment(0, 0x80006000ull, 640, 480,
                                 GFX12::CB_FORMAT_8_8_8_8_UNORM, 4),
           "MSAA attachment rejected (encoding not verified)");
+    check(!b.setColorAttachment(0, 0x80006000ull, 0, 480,
+                                GFX12::CB_FORMAT_8_8_8_8_UNORM),
+          "zero-width color target rejected");
+    check(!b.setColorAttachment(0, 0x80006000ull, 640, 0,
+                                GFX12::CB_FORMAT_8_8_8_8_UNORM),
+          "zero-height color target rejected");
+    check(!b.setColorAttachment(0, 0x80006000ull, 65537, 480,
+                                GFX12::CB_FORMAT_8_8_8_8_UNORM),
+          "color target wider than 16-bit size-1 rejected");
+
+    b.reset();
+    check(b.setScissorRect(10, 20, 640, 480), "scissor rectangle accepted");
+    p = b.getPackets(&n);
+    checkEq(static_cast<uint32_t>(n), 12, "scissor writes four registers");
+    checkEq(p[2], (20u << 16) | 10u, "scissor top-left is unchanged");
+    checkEq(p[5], (20u << 16) | 10u, "viewport scissor top-left is unchanged");
+    checkEq(p[8], (499u << 16) | 649u, "window bottom-right is inclusive");
+    checkEq(p[11], (499u << 16) | 649u, "viewport bottom-right is inclusive");
+    check(!b.setScissorRect(0, 0, 0, 480), "zero-width scissor rejected");
+    check(!b.setScissorRect(0, 0, 640, 0), "zero-height scissor rejected");
+    check(!b.setScissorRect(0xffff, 0, 2, 1), "scissor overflowing 16-bit BR rejected");
 
     b.reset();
     check(b.setBlendState(0, false, 0, 0, 0, 0, 0, 0), "blend disable accepted");

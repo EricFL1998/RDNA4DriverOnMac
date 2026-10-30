@@ -109,21 +109,25 @@ bool GraphicsPM4Builder::setViewport(float originX, float originY, float width,
     const float xoffset = originX + xscale;
     const float yscale = -height * 0.5f;
     const float yoffset = originY + height * 0.5f;
-    const float zscale = (zfar - znear) * 0.5f;
-    const float zoffset = (zfar + znear) * 0.5f;
+    const float zscale = zfar - znear;
+    const float zoffset = znear;
 
-    const uint32_t values[6] = {
+    const uint32_t values[8] = {
         floatBits(xscale), floatBits(xoffset),
         floatBits(yscale), floatBits(yoffset),
         floatBits(zscale), floatBits(zoffset),
+        floatBits(znear), floatBits(zfar),
     };
-    return setRegSeq(GFX12::PA_CL_VPORT_XSCALE, values, 6);
+    return setRegSeq(GFX12::PA_CL_VPORT_XSCALE, values, 8);
 }
 
 bool GraphicsPM4Builder::setScissorRect(uint32_t x, uint32_t y,
                                         uint32_t width, uint32_t height) {
-    const uint32_t tl = (y << 16) | (x & 0xFFFFu);
-    const uint32_t br = ((y + height) << 16) | ((x + width) & 0xFFFFu);
+    constexpr uint32_t limit = 0x10000u;
+    if (width == 0 || height == 0 || x >= limit || y >= limit ||
+        width > limit - x || height > limit - y) return false;
+    const uint32_t tl = (y << 16) | x;
+    const uint32_t br = ((y + height - 1) << 16) | (x + width - 1);
     if (!setReg(GFX12::PA_SC_WINDOW_SCISSOR_TL, tl)) return false;
     if (!setReg(GFX12::PA_SC_VPORT_SCISSOR_0_TL, tl)) return false;
     if (!setReg(GFX12::PA_SC_WINDOW_SCISSOR_BR, br)) return false;
@@ -137,6 +141,7 @@ bool GraphicsPM4Builder::setColorAttachment(uint32_t index, uint64_t gpuAddr,
     // MSAA needs the fragment count and the tile fields of ATTRIB; only the
     // single-sample encoding is verified here.
     if (sampleCount != 1) return false;
+    if (width == 0 || height == 0 || width > 0x10000u || height > 0x10000u) return false;
 
     const uint32_t base = GFX12::CB_COLOR0_BASE + index * GFX12::CB_COLOR_TARGET_STRIDE;
     const uint32_t view = GFX12::CB_COLOR0_VIEW + index * GFX12::CB_COLOR_TARGET_STRIDE;
@@ -148,7 +153,7 @@ bool GraphicsPM4Builder::setColorAttachment(uint32_t index, uint64_t gpuAddr,
     if (!setReg(base, static_cast<uint32_t>(gpuAddr >> 8))) return false;
     if (!setReg(view, 0)) return false;                    // SLICE_START/SLICE_MAX
     if (!setReg(attrib, 0)) return false;                  // no MSAA, no force-alpha
-    if (!setReg(attrib2, (width << 16) | (height & 0xFFFFu))) return false;
+    if (!setReg(attrib2, ((width - 1) << 16) | (height - 1))) return false;
     return setReg(info, cbFormat & 0x1Fu);
 }
 

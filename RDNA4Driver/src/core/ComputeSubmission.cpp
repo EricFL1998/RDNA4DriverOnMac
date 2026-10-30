@@ -42,8 +42,13 @@ bool RDNA4Driver::initComputeRing() {
     uint32_t useMec = 0;
     const bool wantMec =
         PE_parse_boot_argn("rdna4-mec", &useMec, sizeof(useMec)) && useMec != 0;
-    // AMDGPU_DOORBELL_GFX_RING0 is 0x20; doorbell 0 belongs to the KIQ.
-    const uint32_t doorbellIndex = wantMec ? 0u : 0x20u;
+    uint32_t useMes = 0;
+    const bool wantMes =
+        !PE_parse_boot_argn("rdna4-mes", &useMes, sizeof(useMes)) || useMes != 0;
+    // MES SCHED uses dword 0x20. Sharing that doorbell sends later MES
+    // write pointers to this compute queue too, executing stale ring data.
+    const uint32_t doorbellIndex = wantMes ? MesApi::Doorbell::kMecRing0Dword
+                                         : (wantMec ? 0u : 0x20u);
 
     computeRing = new ComputeRing();
     if (!computeRing) {
@@ -75,10 +80,6 @@ bool RDNA4Driver::initComputeRing() {
     computeRptrGpuAddr = rptrAddr;
     computeWptrPollGpuAddr = wptrAddr;
     bool queueOk = false;
-
-    uint32_t useMes = 0;
-    const bool wantMes =
-        !PE_parse_boot_argn("rdna4-mes", &useMes, sizeof(useMes)) || useMes != 0;
 
     if (wantMes) {
         // MES path (mandatory scheduler on GFX12): prepare the KCQ MQD, start
@@ -122,8 +123,19 @@ bool RDNA4Driver::initComputeRing() {
                 queueOk = mesInit();
             }
             if (queueOk) {
+                // Same before/after snapshot as the GFX queue, so the two
+                // MqdDiff properties show what the firmware writes back on a
+                // queue that is known to run.
+                const volatile uint32_t* cm = computeMqdMd
+                    ? static_cast<const volatile uint32_t*>(computeMqdMd->getBytesNoCopy())
+                    : reinterpret_cast<const volatile uint32_t*>(
+                          const_cast<uint8_t*>(vram) + (mqdGpu - gmcContext.vramStart));
+                uint32_t before[512];
+                for (uint32_t i = 0; i < 512; i++) before[i] = cm[i];
                 queueOk = mesMapLegacyQueue(0, 0, doorbellIndex, mqdGpu,
                                             computeWptrGpuAddr, statusAddr, 1);
+                gmcHDPFlush(*this);
+                exportMqdDiff("ComputeQueue", before, cm, 512);
             }
         } else {
             LOG_ERROR("initComputeRing: MES buffer allocation failed");
@@ -152,8 +164,43 @@ bool RDNA4Driver::initComputeRing() {
         // Default path: the graphics ring (ME/PFP), which is the submission
         // path the bring-up reference uses for compute dispatch.
         setProperty("ComputeQueue,Path", "gfx-ring");
-        if (rptrAddr && wptrAddr) {
+        // Upstream (amdgpu_ring_init) and Cobalt64 both keep the GFX ring in
+        // GTT/GART system memory, and this is the one structural difference
+        // left between their working rings and ours (which lives in VRAM).
+        // rdna4-gfx-ring-vram=1 puts it back for A/B.
+        uint32_t wantVramRing = 0;
+        PE_parse_boot_argn("rdna4-gfx-ring-vram", &wantVramRing, sizeof(wantVramRing));
+        const uint32_t ringDwords =
+            static_cast<uint32_t>(VramLayout::kComputeRingSize / sizeof(uint32_t));
+        uint64_t gfxRingGpu = ringGpuAddr;
+        bool ringReady = false;
+        if (wantVramRing == 0) {
+            const uint64_t gartRing =
+                gmcAllocGartBuffer(*this, gmcContext, VramLayout::kComputeRingSize,
+                                   &gfxRingMd);
+            if (gartRing && gfxRingMd) {
+                volatile uint8_t* cpu =
+                    static_cast<volatile uint8_t*>(gfxRingMd->getBytesNoCopy());
+                for (size_t i = 0; i < VramLayout::kComputeRingSize; i++) cpu[i] = 0;
+                volatile uint64_t* fenceCpu = reinterpret_cast<volatile uint64_t*>(
+                    const_cast<uint8_t*>(vram) + VramLayout::kComputeFence);
+                ringReady = computeRing->initAt(
+                    reinterpret_cast<volatile uint32_t*>(cpu), ringDwords,
+                    fenceCpu, doorbell, doorbellIndex);
+                gfxRingGpu = gartRing;
+                setProperty("ComputeQueue,RingGtt", static_cast<uint64_t>(1), 32);
+                LOG("initComputeRing: GFX ring in GART at 0x%llx (%u dwords)",
+                    static_cast<unsigned long long>(gartRing), ringDwords);
+            } else {
+                LOG_ERROR("initComputeRing: GART ring allocation failed, using VRAM");
+            }
+        }
+        if (!ringReady && rptrAddr && wptrAddr) {
             queueOk = initGfxRing(ringGpuAddr,
+                                  static_cast<uint32_t>(VramLayout::kComputeRingSize),
+                                  rptrAddr, wptrAddr, doorbellIndex);
+        } else if (ringReady) {
+            queueOk = initGfxRing(gfxRingGpu,
                                   static_cast<uint32_t>(VramLayout::kComputeRingSize),
                                   rptrAddr, wptrAddr, doorbellIndex);
         } else {

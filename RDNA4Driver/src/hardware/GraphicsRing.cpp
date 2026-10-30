@@ -11,7 +11,7 @@ GraphicsRing::GraphicsRing() {}
 GraphicsRing::~GraphicsRing() {}
 
 bool GraphicsRing::init(volatile uint8_t* vramBase, size_t vramSize,
-                        volatile uint64_t* doorbellBase, uint32_t dbIndex,
+                        volatile uint32_t* doorbellBase, uint32_t dbIndex,
                         uint64_t ringVramOffsetIn, uint64_t ringBytes,
                         uint64_t fenceVramOffsetIn) {
     if (!vramBase || !doorbellBase || ringBytes == 0 ||
@@ -74,9 +74,13 @@ void GraphicsRing::setReadPointer(uint32_t rptr) {
 
 void GraphicsRing::submit() {
     if (!doorbell) return;
-    // The GFX ring takes the same 64-bit doorbell write as the compute ring:
-    // the dword write pointer, which is what the CP polls.
-    *doorbell = writePtr;
+    // gfx_v12_0_ring_set_wptr_gfx(): WDOORBELL64(ring->doorbell_index, wptr).
+    // amdgpu_mm_wdoorbell64 indexes a u32* and stores 64 bits, so the doorbell
+    // dword and the one above it are written together: the CP samples the pair
+    // as one 64-bit write pointer, and a half-write is not guaranteed to
+    // register at all.
+    *reinterpret_cast<volatile uint64_t*>(
+        const_cast<uint32_t*>(doorbell)) = static_cast<uint64_t>(writePtr);
 }
 
 bool GraphicsRing::waitForFence(uint64_t fenceValue, uint64_t timeoutMS) {

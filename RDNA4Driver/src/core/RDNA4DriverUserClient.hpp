@@ -19,6 +19,9 @@ class RDNA4Driver;
 //   2 FreeBuffer      1 in, 0 out   { GPU address }
 //   3 SubmitCommands  struct in, 1 out  PM4 dwords -> fence value
 //   4 WaitFence       2 in, 0 out   { fence value, timeout ms }
+//   5 SubmitGraphics  struct in, 1 out  GFX PM4 dwords -> fence value
+//   6 WaitGraphicsFence 2 in, 0 out  { fence value, timeout ms }
+//   7 GetGraphicsInfo 0 in, 4 out   { ready, fence GPU address, 0, 0 }
 //
 // Memory type 0 (IOConnectMapMemory64) maps the user window; that is the only
 // VRAM a client may touch.

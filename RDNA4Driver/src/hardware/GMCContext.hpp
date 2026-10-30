@@ -41,5 +41,6 @@ void gmcHDPFlush(RDNA4Driver& driver);
 // retained descriptor the caller must keep alive and release.
 uint64_t gmcAllocGartBuffer(RDNA4Driver& driver, GMCContext& gmc, size_t size,
                             IOBufferMemoryDescriptor** outMd);
+void gmcUnmapGartBuffers(RDNA4Driver& driver, GMCContext& gmc);
 // Flushes both hubs' TLBs after page table edits.
 void gmcInvalidateTlb(RDNA4Driver& driver);

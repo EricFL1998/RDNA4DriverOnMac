@@ -55,6 +55,8 @@ constexpr uint32_t PA_CL_VPORT_YSCALE        = 0x28444u;
 constexpr uint32_t PA_CL_VPORT_YOFFSET       = 0x28448u;
 constexpr uint32_t PA_CL_VPORT_ZSCALE        = 0x2844cu;
 constexpr uint32_t PA_CL_VPORT_ZOFFSET       = 0x28450u;
+constexpr uint32_t PA_SC_VPORT_ZMIN_0        = 0x28454u;
+constexpr uint32_t PA_SC_VPORT_ZMAX_0        = 0x28458u;
 constexpr uint32_t PA_CL_VPORT_STRIDE        = 0x10u;
 
 constexpr uint32_t SPI_PS_IN_CONTROL         = 0x28640u;

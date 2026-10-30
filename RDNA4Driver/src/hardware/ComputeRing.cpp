@@ -20,6 +20,30 @@ ComputeRing::~ComputeRing() {
     // Cleanup is handled by RDNA4Driver unmapping VRAM
 }
 
+bool ComputeRing::initAt(volatile uint32_t* ringCpu, uint32_t ringDwords,
+                         volatile uint64_t* fenceCpu,
+                         volatile uint32_t* doorbellBase, uint32_t dbIndex) {
+    if (!ringCpu || !fenceCpu || !doorbellBase || ringDwords < 8 ||
+        (ringDwords & (ringDwords - 1u)) != 0) {
+        IOLog("ComputeRing: initAt() invalid parameters\n");
+        return false;
+    }
+    ringBuffer = ringCpu;
+    ringSize = ringDwords;
+    ringVRAMOffset = 0;
+    fenceVRAMOffset = VramLayout::kComputeFence;
+    fenceAddress = fenceCpu;
+    *fenceAddress = 0;
+    doorbell = doorbellBase + dbIndex;
+    doorbellIndex = dbIndex;
+    writePtr = 0;
+    readPtr = 0;
+    currentFence = 0;
+    IOLog("ComputeRing: initAt() - ring cpu=%p %u dwords, fence cpu=%p, doorbellIndex=%u\n",
+          ringCpu, ringDwords, fenceCpu, dbIndex);
+    return true;
+}
+
 bool ComputeRing::init(volatile uint8_t* vramBase, size_t vramSize,
                        volatile uint32_t* doorbellBase, uint32_t dbIndex) {
     IOLog("ComputeRing: init() - vramBase=%p, vramSize=%zu, doorbellIndex=%u\n",

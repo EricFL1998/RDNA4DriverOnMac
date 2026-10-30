@@ -28,6 +28,7 @@ CPP_SOURCES = $(SRC_DIR)/core/RDNA4Driver.cpp \
 		$(SRC_DIR)/hardware/SMUMailbox.cpp \
 		$(SRC_DIR)/hardware/GFXFirmware.cpp \
 		$(SRC_DIR)/hardware/GMCInit.cpp \
+		$(SRC_DIR)/hardware/GARTUtils.cpp \
 		$(SRC_DIR)/hardware/NBIODoorbell.cpp \
 		$(SRC_DIR)/hardware/ComputeRing.cpp \
 		$(SRC_DIR)/hardware/ComputeQueue.cpp \
@@ -112,13 +113,29 @@ clean:
 	@echo "Cleaning build files..."
 	rm -rf $(BUILD_DIR)
 
-# Host-side packet checks for the graphics encoder. No hardware, no IOKit.
+# Host-side checks: PM4 encoder bytes, MES API frame layout, GFX ring
+# doorbell. No hardware, no IOKit (tests/host-shim stands in for IOLib).
 test-pm4:
 	@mkdir -p $(BUILD_DIR)/tests
 	$(CXX) -std=c++17 -Wall -Wextra -I$(SRC_DIR)/hardware \
 		$(SRC_DIR)/hardware/GraphicsPM4Builder.cpp tests/test_graphics_pm4.cpp \
 		-o $(BUILD_DIR)/tests/test_graphics_pm4
 	./$(BUILD_DIR)/tests/test_graphics_pm4
+	$(CXX) -std=c++17 -Wall -Wextra -I$(SRC_DIR)/hardware \
+		tests/test_mes_api.cpp -o $(BUILD_DIR)/tests/test_mes_api
+	./$(BUILD_DIR)/tests/test_mes_api
+	$(CXX) -std=c++17 -Wall -Wextra -Itests/host-shim -I$(SRC_DIR)/hardware \
+		$(SRC_DIR)/hardware/GraphicsRing.cpp tests/test_graphics_ring.cpp \
+		-o $(BUILD_DIR)/tests/test_graphics_ring
+	./$(BUILD_DIR)/tests/test_graphics_ring
+	$(CXX) -std=c++17 -Wall -Wextra -Itests/host-shim -I$(SRC_DIR)/hardware \
+		$(SRC_DIR)/hardware/ComputeRing.cpp tests/test_compute_ring.cpp \
+		-o $(BUILD_DIR)/tests/test_compute_ring
+	./$(BUILD_DIR)/tests/test_compute_ring
+	$(CXX) -std=c++17 -Wall -Wextra -Itests/host-shim -I$(SRC_DIR)/hardware \
+		$(SRC_DIR)/hardware/GARTUtils.cpp tests/test_gart_utils.cpp \
+		-o $(BUILD_DIR)/tests/test_gart_utils
+	./$(BUILD_DIR)/tests/test_gart_utils
 
 install: $(KEXT_DIR)
 	@echo "Installing kext to /Library/Extensions..."

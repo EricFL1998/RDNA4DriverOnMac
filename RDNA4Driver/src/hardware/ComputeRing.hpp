@@ -18,6 +18,13 @@ public:
     // Initialize ring buffer (allocate VRAM + map doorbell)
     bool init(volatile uint8_t* vramBase, size_t vramSize,
               volatile uint32_t* doorbellBase, uint32_t doorbellIndex);
+
+    // Initialize on caller-provided memory.  The GFX ring can live in GART
+    // system memory (that is where upstream and Cobalt64 put it) while the
+    // fence stays in VRAM next to the other driver buffers.
+    bool initAt(volatile uint32_t* ringCpu, uint32_t ringDwords,
+                volatile uint64_t* fenceCpu,
+                volatile uint32_t* doorbellBase, uint32_t doorbellIndex);
     
     // Write PM4 packet to ring
     bool writePM4(const uint32_t* packet, size_t dwordCount);

@@ -1,4 +1,5 @@
 #include "GMCContext.hpp"
+#include "GARTUtils.hpp"
 #include "../core/RDNA4Driver.hpp"
 #include "VramLayout.hpp"
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -676,6 +677,19 @@ uint64_t gmcAllocGartBuffer(RDNA4Driver& driver, GMCContext& gmc, size_t size,
         pages, static_cast<unsigned long long>(gpuAddr),
         static_cast<unsigned long long>(phys));
     return gpuAddr;
+}
+
+void gmcUnmapGartBuffers(RDNA4Driver& driver, GMCContext& gmc) {
+    if (gmc.gartNextPage == 0x1000) return;
+    volatile uint8_t* vram = nullptr;
+    size_t vramSize = 0;
+    driver.vramWindow(vram, vramSize);
+    const uint64_t dummyPte = (gmc.dummyPagePhys & ~0xFFFULL) | GART_PTE_FLAGS;
+    if (gmcResetGartTable(vram, vramSize, gmc, dummyPte)) {
+        gmcInvalidateTlb(driver);
+    } else {
+        LOG_ERROR("GMC: failed to reset allocated GART table entries");
+    }
 }
 
 void gmcInvalidateTlb(RDNA4Driver& driver) {

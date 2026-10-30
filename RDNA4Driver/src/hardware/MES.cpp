@@ -1,6 +1,7 @@
 #include "../core/RDNA4Driver.hpp"
 #include "VramLayout.hpp"
 #include "GMCContext.hpp"
+#include "MesApi.hpp"
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSData.h>
 
@@ -294,11 +295,25 @@ bool RDNA4Driver::mesInit() {
         }
     }
 
-    // The CP drops doorbell writes outside CP_MEC_DOORBELL_RANGE. The MES
-    // rings use indexes 0x20/0x22 (Cobalt64 convention), so open the range wide
-    // before ringing them (Linux sets this in cp_set_doorbell_range).
-    writeGcRegister(0x1DFC, 0, 0);          // CP_MEC_DOORBELL_RANGE_LOWER
-    writeGcRegister(0x1DFD, 0x0000FFFCu, 0); // CP_MEC_DOORBELL_RANGE_UPPER
+    // gfx_v12_0_cp_set_doorbell_range(): two disjoint windows.  A doorbell
+    // inside CP_MEC_DOORBELL_RANGE is handled by the MEC whatever queue the
+    // MES mapped it to, so the GFX ring's doorbell has to sit in the CP_RB
+    // window above it.  The MES rings (0x20/0x22) and the compute ring (0x06)
+    // stay inside the MEC window.
+    writeGcRegister(MesApi::Doorbell::kRegMecRangeLower,
+                    MesApi::Doorbell::rangeValue(MesApi::Doorbell::kKiq), 0);
+    writeGcRegister(MesApi::Doorbell::kRegMecRangeUpper,
+                    MesApi::Doorbell::rangeValue(MesApi::Doorbell::kUserQueueEnd), 0);
+    writeGcRegister(MesApi::Doorbell::kRegRbRangeLower,
+                    MesApi::Doorbell::rangeValue(MesApi::Doorbell::kGfxRing0), 0);
+    writeGcRegister(MesApi::Doorbell::kRegRbRangeUpper,
+                    MesApi::Doorbell::rangeValue(MesApi::Doorbell::kGfxUserQueueEnd), 0);
+    setProperty("MES,RbDoorbellRange",
+                (static_cast<uint64_t>(readGcRegister(MesApi::Doorbell::kRegRbRangeUpper, 0)) << 32) |
+                    readGcRegister(MesApi::Doorbell::kRegRbRangeLower, 0), 64);
+    setProperty("MES,MecDoorbellRange",
+                (static_cast<uint64_t>(readGcRegister(MesApi::Doorbell::kRegMecRangeUpper, 0)) << 32) |
+                    readGcRegister(MesApi::Doorbell::kRegMecRangeLower, 0), 64);
 
     // --- MQD + HQD programming (only after MES is running) ---
     for (uint32_t pipe = 0; pipe < 2; pipe++) {
@@ -516,13 +531,26 @@ bool RDNA4Driver::mesInit() {
 
 bool RDNA4Driver::mesSubmitAndWait(uint32_t pipe, const uint32_t* pkt,
                                    uint32_t dwords, uint64_t statusGpuAddr) {
-    if (pipe > 1 || !pkt || dwords == 0 || dwords + 64 > mesRingDwords[pipe]) {
+    if (pipe > 1 || !pkt || dwords == 0 || dwords > MesApi::kFrameDwords ||
+        dwords + 64 > mesRingDwords[pipe] || mesTimedOut) {
         return false;
     }
+    const uint32_t opcode = (pkt[0] >> 4) & 0xFFu;
+    const uint32_t statusDw = MesApi::completionStatusDword(opcode);
+    if (statusDw == 0 || statusDw + 3 >= dwords) return false;
+
+    uint32_t frame[MesApi::kFrameDwords];
+    memcpy(frame, pkt, dwords * sizeof(uint32_t));
+    mesFenceSeq = MesApi::nextCompletionFence(mesFenceSeq);
+    const uint32_t fence = mesFenceSeq;
 
     // Status/fence slots always come from the MES status page; a caller-supplied
     // address is ignored so the two alloc modes behave identically.
     statusGpuAddr = mesStatusGpuAddr;
+    frame[statusDw] = static_cast<uint32_t>(statusGpuAddr);
+    frame[statusDw + 1] = static_cast<uint32_t>(statusGpuAddr >> 32);
+    frame[statusDw + 2] = fence;
+    frame[statusDw + 3] = 0;
 
     volatile uint32_t* ring = reinterpret_cast<volatile uint32_t*>(
         mesBufferCpu(mesRingMd[pipe], mesRingGpuAddr[pipe]));
@@ -539,7 +567,7 @@ bool RDNA4Driver::mesSubmitAndWait(uint32_t pipe, const uint32_t* pkt,
 
     uint32_t w = mesRingWrite[pipe];
     for (uint32_t i = 0; i < dwords; i++) {
-        ring[w] = pkt[i];
+        ring[w] = frame[i];
         w = (w + 1) % mesRingDwords[pipe];
     }
 
@@ -549,7 +577,7 @@ bool RDNA4Driver::mesSubmitAndWait(uint32_t pipe, const uint32_t* pkt,
     query[1] = 0;  // subopcode
     query[2] = static_cast<uint32_t>(statusGpuAddr + 8);
     query[3] = static_cast<uint32_t>((statusGpuAddr + 8) >> 32);
-    query[4] = 1;  // fence value low
+    query[4] = fence;
     query[5] = 0;
     for (uint32_t i = 0; i < 64; i++) {
         ring[w] = query[i];
@@ -608,13 +636,27 @@ bool RDNA4Driver::mesSubmitAndWait(uint32_t pipe, const uint32_t* pkt,
     }
 
     for (uint32_t i = 0; i < 1000; i++) {
-        if (*qry == 1) {
-            if ((static_cast<uint32_t>(*api0) & 0xFFFFFFFFu) != 0) {
-                return true;
-            }
+        const uint64_t api = *api0;
+        if (MesApi::completionFailed(api)) {
+            setProperty("MES,ApiStatus", api, 64);
+            setProperty("MES,QryStatus", *qry, 64);
+            LOG_ERROR("mesSubmitAndWait: pipe %u API error=0x%llx query=0x%llx",
+                      pipe, static_cast<unsigned long long>(api),
+                      static_cast<unsigned long long>(*qry));
+            return false;
+        }
+        if (MesApi::completionSucceeded(api, fence)) {
+            setProperty("MES,ApiStatus", api, 64);
+            setProperty("MES,QryStatus", *qry, 64);
+            LOG("mesSubmitAndWait: pipe %u complete api=0x%llx query=0x%llx",
+                pipe, static_cast<unsigned long long>(api),
+                static_cast<unsigned long long>(*qry));
+            return true;
         }
         IOSleep(1);
     }
+    mesTimedOut = true;
+    setProperty("MES,TimedOut", static_cast<uint64_t>(1), 32);
     grbmSelect(3, pipe, 0, 0);
     const uint32_t rptr = readGcRegister(0x1FB3, 0);
     const uint32_t wptrLo = readGcRegister(0x1FDF, 0);
@@ -677,56 +719,34 @@ bool RDNA4Driver::mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
                                     uint64_t wptrAddr, uint64_t statusAddr,
                                     uint32_t queueType) {
     (void)statusAddr;
-    uint32_t pkt[64] = {};
+    uint32_t pkt[MesApi::kFrameDwords];
 
-    pkt[0] = 1u | (2u << 4) | (64u << 12);  // type=scheduler, op=ADD_QUEUE, 64 dwords
-    pkt[18] = doorbellOffset;
-    pkt[20] = static_cast<uint32_t>(mqdAddr);
-    pkt[21] = static_cast<uint32_t>(mqdAddr >> 32);
-    pkt[22] = static_cast<uint32_t>(wptrAddr);
-    pkt[23] = static_cast<uint32_t>(wptrAddr >> 32);
-    pkt[28] = queueType;     // 0 = GFX, 1 = COMPUTE, 2 = SDMA
-    // MES_AddQueue dword map (mes_v12_api_def.h): 38 = vm_context_cntl,
-    // 39 = flags, 40/41 = api_status. Writing the status address into 38/39
-    // put a VRAM address into `flags`, so map_legacy_kq (bit 13) was never
-    // set: compute queues still map through the non-legacy path, but a GFX
-    // queue is only loaded into the GFX HQD when this bit is present.
-    // Measured on this firmware: putting map_legacy_kq into the real flags
-    // dword (39) makes the MES reject ADD_QUEUE for *every* queue type, so the
-    // layout the working compute queue uses is kept here. The consequence is
-    // that a GFX queue is only ever added through the non-legacy path, which
-    // the firmware acks without loading the GFX HQD - see GraphicsQueue.cpp.
-    pkt[37] = (1u << 13);
-    pkt[38] = static_cast<uint32_t>(mesStatusGpuAddr);
-    pkt[39] = static_cast<uint32_t>(mesStatusGpuAddr >> 32);
-    pkt[40] = 1;                 // api completion fence value
-    pkt[41] = 0;
-    pkt[50] = pipe;
-    pkt[51] = queue;
+    // mes_v12_0_map_legacy_queue(): flags (map_legacy_kq) is dw37 and the
+    // completion fence lives at dw38..41, see MesApi.hpp.  mesSubmitAndWait
+    // polls the first qword of the MES status page, so that is the fence
+    // address the firmware has to write.
+    MesApi::AddQueueInput in {};
+    in.doorbellOffset = doorbellOffset;
+    in.mqdAddr = mqdAddr;
+    in.wptrAddr = wptrAddr;
+    in.queueType = queueType;
+    in.pipe = pipe;
+    in.queue = queue;
+    in.fenceAddr = mesStatusGpuAddr;
+    in.fenceValue = 1;
+    MesApi::buildAddQueueLegacy(pkt, in);
 
-    LOG("mesMapLegacyQueue: queuePipe=%u queue=%u db=%u mqd=0x%llx wptr=0x%llx",
-        pipe, queue, doorbellOffset,
+    LOG("mesMapLegacyQueue: type=%u queuePipe=%u queue=%u db=%u mqd=0x%llx wptr=0x%llx flags=0x%x",
+        queueType, pipe, queue, doorbellOffset,
         static_cast<unsigned long long>(mqdAddr),
-        static_cast<unsigned long long>(wptrAddr));
+        static_cast<unsigned long long>(wptrAddr), pkt[MesApi::AddQueue::kFlags]);
 
-    // mes_v12_0_map_legacy_queue(): with uni-MES the ADD_QUEUE for a *compute*
-    // queue goes to the KIQ pipe (1).  A GFX queue belongs to the scheduler
-    // pipe (0): the KIQ acks the request and then leaves the GFX HQD
-    // un-activated, which looks like success until nothing executes.
-    bool ok;
-    if (queueType == 0) {
-        ok = mesSubmitAndWait(0, pkt, 64, statusAddr);
-        setProperty("MES,SchedPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
-        if (!ok) ok = mesSubmitAndWait(1, pkt, 64, statusAddr);
-        setProperty("MES,KiqPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
-    } else {
-        ok = mesSubmitAndWait(1, pkt, 64, statusAddr);
-        setProperty("MES,KiqPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
-        if (!ok) {
-            ok = mesSubmitAndWait(0, pkt, 64, statusAddr);
-        }
-        setProperty("MES,SchedPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
-    }
+    // mes_v12_0_map_legacy_queue(): with uni-MES every kernel queue (GFX and
+    // compute alike) is added on the SCHED pipe; only the MES ring itself
+    // goes to the KIQ pipe.  Splitting them across the two pipes (compute on
+    // KIQ, GFX on SCHED) had each scheduler keep its own idea of pipe0/queue0.
+    bool ok = mesSubmitAndWait(0, pkt, 64, statusAddr);
+    setProperty("MES,SchedPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
     setProperty("MES,MapQueueOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
 
     if (!ok) {
@@ -815,21 +835,29 @@ bool RDNA4Driver::mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
 }
 
 bool RDNA4Driver::mesSetHwResources(uint32_t pipe) {
-    if (!mesSchCtxGpuAddr) {
-        mesSchCtxGpuAddr = allocateVRAMBuffer(kMesSchCtxBytes);
+    if (pipe > 1) return false;
+    // amdgpu_mes_init(): every MES pipe gets its own scheduler context and
+    // query-status fence.  Sharing one block between the KIQ and SCHED pipes
+    // let the second SET_HW_RESOURCES zero what the first pipe had just set
+    // up, and both pipes then kept their queue tables in the same memory.
+    if (!mesSchCtxGpuAddr[pipe]) {
+        mesSchCtxGpuAddr[pipe] = gmcAllocGartBuffer(*this, gmcContext, kMesSchCtxBytes,
+                                                    &mesSchCtxMd[pipe]);
     }
-    if (!mesStatusFenceGpuAddr) {
-        mesStatusFenceGpuAddr = allocateVRAMBuffer(4096);
+    if (!mesStatusFenceGpuAddr[pipe]) {
+        mesStatusFenceGpuAddr[pipe] = gmcAllocGartBuffer(*this, gmcContext, 4096,
+                                                         &mesStatusFenceMd[pipe]);
     }
-    if (!mesSchCtxGpuAddr || !mesStatusFenceGpuAddr) {
+    if (!mesSchCtxGpuAddr[pipe] || !mesStatusFenceGpuAddr[pipe] ||
+        !mesSchCtxMd[pipe] || !mesStatusFenceMd[pipe]) {
         LOG_ERROR("mesSetHwResources: scheduler context/fence allocation failed");
         setProperty("MES,HwRsrc", static_cast<uint64_t>(0), 32);
         return false;
     }
     {
-        volatile uint8_t* p = mesBufferCpu(mesSchCtxMd, mesSchCtxGpuAddr);
+        volatile uint8_t* p = mesBufferCpu(mesSchCtxMd[pipe], mesSchCtxGpuAddr[pipe]);
         for (uint32_t i = 0; i < kMesSchCtxBytes; i++) p[i] = 0;
-        p = mesBufferCpu(mesStatusFenceMd, mesStatusFenceGpuAddr);
+        p = mesBufferCpu(mesStatusFenceMd[pipe], mesStatusFenceGpuAddr[pipe]);
         for (uint32_t i = 0; i < 64; i++) p[i] = 0;
     }
     gmcInvalidateTlb(*this);
@@ -850,10 +878,10 @@ bool RDNA4Driver::mesSetHwResources(uint32_t pipe) {
     for (uint32_t i = 0; i < kMesPriorityLevels; i++)
         pkt[17 + i] = kMesAggregatedDoorbellBase + i * 2;
 
-    pkt[22] = static_cast<uint32_t>(mesSchCtxGpuAddr);
-    pkt[23] = static_cast<uint32_t>(mesSchCtxGpuAddr >> 32);
-    pkt[24] = static_cast<uint32_t>(mesStatusFenceGpuAddr);
-    pkt[25] = static_cast<uint32_t>(mesStatusFenceGpuAddr >> 32);
+    pkt[22] = static_cast<uint32_t>(mesSchCtxGpuAddr[pipe]);
+    pkt[23] = static_cast<uint32_t>(mesSchCtxGpuAddr[pipe] >> 32);
+    pkt[24] = static_cast<uint32_t>(mesStatusFenceGpuAddr[pipe]);
+    pkt[25] = static_cast<uint32_t>(mesStatusFenceGpuAddr[pipe] >> 32);
 
     // MES resolves its own registers as base[segment] + offset, so the packet
     // must carry every segment base the firmware will touch.
@@ -872,15 +900,23 @@ bool RDNA4Driver::mesSetHwResources(uint32_t pipe) {
     pkt[51] = static_cast<uint32_t>(mesStatusGpuAddr >> 32);
     pkt[52] = 1;      // api completion fence value
     pkt[53] = 0;
-    // disable_reset | use_different_vmid_compute | enable_level_process_quantum_check
-    // | enable_mes_event_int_logging | enable_reg_active_poll
-    // | unmapped_doorbell_handling(BASIC).  disable_mes_log is left clear so the
-    // firmware's own event history (event_intr_history_gpu_mc_ptr) is written.
-    pkt[54] = (1u << 0) | (1u << 1) | (1u << 6) | (1u << 9) | (1u << 10) |
-              (1u << 19);
+    // mes_v12_0_set_hw_resources(): disable_reset | use_different_vmid_compute
+    // | disable_mes_log | enable_level_process_quantum_check
+    // | enable_reg_active_poll | unmapped_doorbell_handling = 2 (basic+).
+    // The event log is only handed over with rdna4-mes-log=1: with it on
+    // (0.8.0 - 0.8.4) the second ADD_QUEUE was acked but its MQD never read.
+    uint32_t wantMesLog = 0;
+    PE_parse_boot_argn("rdna4-mes-log", &wantMesLog, sizeof(wantMesLog));
+    pkt[54] = (1u << 0) | (1u << 1) | (1u << 6) | (1u << 10) | (2u << 19);
     pkt[55] = 50;     // oversubscription_timer
-    pkt[58] = static_cast<uint32_t>(mesEventLogGpuAddr);        // event_intr_history
-    pkt[59] = static_cast<uint32_t>(mesEventLogGpuAddr >> 32);
+    if (wantMesLog != 0 && mesEventLogGpuAddr) {
+        pkt[54] |= (1u << 9);   // enable_mes_event_int_logging
+        pkt[58] = static_cast<uint32_t>(mesEventLogGpuAddr);        // event_intr_history
+        pkt[59] = static_cast<uint32_t>(mesEventLogGpuAddr >> 32);
+    } else {
+        pkt[54] |= (1u << 2);   // disable_mes_log
+    }
+    setProperty("MES,HwRsrcFlags", static_cast<uint64_t>(pkt[54]), 32);
 
     LOG("mesSetHwResources: vmid=0x%x compute=0x%x gfx=0x%x sdma=0x%x "
         "gc0=0x%x mmhub0=0x%x osssys0=0x%x",

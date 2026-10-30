@@ -1,7 +1,9 @@
 #include "../core/RDNA4Driver.hpp"
 #include "VramLayout.hpp"
 #include "GMCContext.hpp"
+#include "MesApi.hpp"
 #include <IOKit/IOLib.h>
+#include <libkern/c++/OSData.h>
 
 //==============================================================================
 // CP/MEC compute queue
@@ -701,6 +703,40 @@ bool RDNA4Driver::enableCpGfx() {
                 static_cast<uint64_t>(readGcRegister(kRegCP_DEVICE_ID, 0)), 32);
     setProperty("GfxRing,CpMaxContext",
                 static_cast<uint64_t>(readGcRegister(kRegCP_MAX_CONTEXT, 0)), 32);
+
+    // RS64 liveness and cache bases.  CP_GFX_RS64_INSTR_PNTR0/1 are the PC
+    // counters upstream lists for gfx12 (gc_12_0_0_offset.h, BASE_IDX 1);
+    // CP_PFP/ME_INSTR_PNTR are the older SMU-facing ones and read 0 here.
+    // CP_GFX_RS64_DC_BASE0/1 are the data-cache (stack) bases: an RS64 core
+    // released from halt with DC_BASE 0 cannot execute, which looks exactly
+    // like "the CP never fetches from the ring".
+    {
+        grbmSelect(0, 0, 0, 0);
+        const uint32_t p0a = readGcRegister(0x2A44, 1);
+        const uint32_t p1a = readGcRegister(0x2A45, 1);
+        IODelay(2000);
+        const uint32_t p0b = readGcRegister(0x2A44, 1);
+        const uint32_t p1b = readGcRegister(0x2A45, 1);
+        const uint32_t pfpIc = readGcRegister(0x5840, 1);
+        const uint32_t meIc = readGcRegister(0x5844, 1);
+        const uint32_t pfpIcCntl = readGcRegister(0x5842, 1);
+        const uint32_t meIcCntl = readGcRegister(0x5846, 1);
+        const uint32_t pfpDc = readGcRegister(0x5863, 1);
+        const uint32_t meDc = readGcRegister(0x5864, 1);
+        LOG("enableCpGfx: RS64 PNTR0 %u->%u PNTR1 %u->%u | PFP ic=0x%08x cntl=0x%08x dc=0x%08x"
+            " | ME ic=0x%08x cntl=0x%08x dc=0x%08x",
+            p0a, p0b, p1a, p1b, pfpIc, pfpIcCntl, pfpDc, meIc, meIcCntl, meDc);
+        setProperty("GfxRing,Rs64Pntr0A", static_cast<uint64_t>(p0a), 32);
+        setProperty("GfxRing,Rs64Pntr0B", static_cast<uint64_t>(p0b), 32);
+        setProperty("GfxRing,Rs64Pntr1A", static_cast<uint64_t>(p1a), 32);
+        setProperty("GfxRing,Rs64Pntr1B", static_cast<uint64_t>(p1b), 32);
+        setProperty("GfxRing,PfpIcBase", static_cast<uint64_t>(pfpIc), 32);
+        setProperty("GfxRing,PfpIcCntl", static_cast<uint64_t>(pfpIcCntl), 32);
+        setProperty("GfxRing,MeIcBase", static_cast<uint64_t>(meIc), 32);
+        setProperty("GfxRing,MeIcCntl", static_cast<uint64_t>(meIcCntl), 32);
+        setProperty("GfxRing,PfpDcBase", static_cast<uint64_t>(pfpDc), 32);
+        setProperty("GfxRing,MeDcBase", static_cast<uint64_t>(meDc), 32);
+    }
     return true;
 }
 
@@ -727,8 +763,9 @@ bool RDNA4Driver::initGfxRing(uint64_t ringGpuAddr, uint32_t ringSizeBytes,
     // gfx_v12_0_cp_gfx_resume: RB_BUFSZ = log2(ring_bytes / 8),
     // RB_BLKSZ = RB_BUFSZ - 2.
     const uint32_t rbBufsz = orderBase2(ringSizeBytes / 8u);
-    const uint32_t rbCntl = (rbBufsz & 0x3Fu) |
-                            (((rbBufsz >= 2u ? rbBufsz - 2u : 0u) & 0x3Fu) << 8);
+    // KMD_QUEUE (bit 29) is what makes the CP fetch this ring as a kernel
+    // queue; without it the ring is treated as a user queue and never fetched.
+    const uint32_t rbCntl = MesApi::GfxHqd::cntlValue(rbBufsz);
 
     grbmSelect(0, 0, 0, 0);   // graphics ME0 / PIPE0
 
@@ -783,6 +820,32 @@ bool RDNA4Driver::initGfxRing(uint64_t ringGpuAddr, uint32_t ringSizeBytes,
     setProperty("GfxRing,RptrGPU", rptrGpuAddr, 64);
     setProperty("GfxRing,WptrGPU", wptrGpuAddr, 64);
     return (activeRead & 1u) != 0;
+}
+
+void RDNA4Driver::exportMqdDiff(const char* prefix, const uint32_t* before,
+                                const volatile uint32_t* after, uint32_t dwords) {
+    char key[64];
+    OSData* diff = OSData::withCapacity(64 * 12);
+    uint32_t changed = 0;
+    for (uint32_t i = 0; i < dwords; i++) {
+        const uint32_t a = after[i];
+        if (a == before[i]) continue;
+        changed++;
+        if (diff && changed <= 64) {
+            const uint32_t triple[3] = { i, before[i], a };
+            diff->appendBytes(triple, sizeof(triple));
+        }
+        if (changed <= 16) {
+            LOG("%s: MQD[%u] 0x%08x -> 0x%08x", prefix, i, before[i], a);
+        }
+    }
+    snprintf(key, sizeof(key), "%s,MqdDiffCount", prefix);
+    setProperty(key, static_cast<uint64_t>(changed), 32);
+    if (diff) {
+        snprintf(key, sizeof(key), "%s,MqdDiff", prefix);
+        setProperty(key, diff);
+        diff->release();
+    }
 }
 
 void RDNA4Driver::dumpComputeQueueState() {
