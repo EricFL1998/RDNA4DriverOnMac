@@ -92,6 +92,12 @@ bool RDNA4Driver::initGraphicsRing() {
         return false;
     }
     graphicsRingGpuAddr = ringGpu;
+    const uint64_t rptrOffset = graphicsRptrGpuAddr - gmcContext.vramStart;
+    if (rptrOffset > vramSize || 4096 > vramSize - rptrOffset) {
+        LOG_ERROR("initGraphicsRing: rptr page outside VRAM");
+        return false;
+    }
+    memset(const_cast<uint8_t*>(vram) + rptrOffset, 0, 4096);
 
     graphicsRing = new GraphicsRing();
     if (!graphicsRing ||
@@ -171,6 +177,13 @@ bool RDNA4Driver::initGraphicsRing() {
         static_cast<unsigned long long>(ringGpu), graphicsDoorbellIndex,
         graphicsRbBufsz, graphicsQueueMapped ? 1u : 0u);
     if (!graphicsQueueMapped) return false;
+
+    writeGcRegister(0x2040, 0xCAFEDEAD, 1);
+    setProperty("GraphicsQueue,DirectScratchReadback",
+                static_cast<uint64_t>(readGcRegister(0x2040, 1)), 32);
+    writeGcRegister(0xA10F, 0x12345678, 1);
+    setProperty("GraphicsQueue,DirectViewportReadback",
+                static_cast<uint64_t>(readGcRegister(0xA10F, 1)), 32);
 
     // What the firmware wrote back into the MQD is the proof it consumed it.
     gmcHDPFlush(*this);
@@ -281,6 +294,7 @@ void RDNA4Driver::snapshotGraphicsQueue(const char* stage) {
         {"DcOp", 0x2A09, 1}, {"DcCtl", 0x2A08, 1},
         {"FaultLo", 0x15D0, 0}, {"FaultHi", 0x15D1, 0},
         {"FaultAddrLo", 0x15D2, 0}, {"FaultAddrHi", 0x15D3, 0},
+        {"ViewportXScale", 0xA10F, 1}, {"ScratchReg0", 0x2040, 1},
     };
     char key[64];
     auto publish = [&](const char* name, uint64_t value) {
@@ -289,6 +303,11 @@ void RDNA4Driver::snapshotGraphicsQueue(const char* stage) {
     };
     for (const Reg& reg : regs) {
         publish(reg.name, readGcRegister(reg.offset, reg.segment));
+    }
+    for (uint8_t segment = 0; segment < 5; segment++) {
+        char name[32];
+        snprintf(name, sizeof(name), "ViewportXScaleSeg%u", segment);
+        publish(name, readGcRegister(0xA10F, segment));
     }
     grbmSelect(1, 0, 0, 0);
     publish("CmpActive", readGcRegister(0x1FAB, 0));

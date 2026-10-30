@@ -93,20 +93,18 @@ static void testGfxHqdRegisterSegments() {
     checkEq(MesApi::GfxHqd::kMapped, 0x1E94u, "regCP_GFX_HQD_MAPPED");
     checkEq(MesApi::GfxHqd::kSegment, 0u, "BASE_IDX of the CP_GFX_HQD block");
 
-    // gc_12_0_0_sh_mask.h: CP_RB0_CNTL__KMD_QUEUE__SHIFT and
-    // CP_GFX_HQD_CNTL__KMD_QUEUE__SHIFT are both 0x1d.  Without this bit the
-    // CP treats the ring as a user queue and never fetches it, which is the
-    // state every GFX bring-up attempt shipped in (CNTL 0x0f91 / 0x00f00b0d).
+    // gfx_v12_0_gfx_mqd_init starts with regCP_GFX_HQD_CNTL_DEFAULT and only
+    // overrides RB_BUFSZ/RB_BLKSZ. KMD_QUEUE and RB_EXE stay clear on GFX12.
     checkEq(MesApi::GfxHqd::kCntlKmdQueue, 0x20000000u, "KMD_QUEUE is bit 29");
     checkEq(MesApi::GfxHqd::kCntlRbExe, 0x10000000u, "RB_EXE is bit 28");
     for (uint32_t bufsz = 8; bufsz <= 18; bufsz++) {
         const uint32_t v = MesApi::GfxHqd::cntlValue(bufsz);
-        checkEq((v & 0x20000000u) != 0, 1, "cntlValue sets KMD_QUEUE");
-        checkEq((v & 0x10000000u) != 0, 1, "cntlValue sets RB_EXE");
+        checkEq((v & 0x20000000u) == 0, 1, "GFX12 cntlValue leaves KMD_QUEUE clear");
+        checkEq((v & 0x10000000u) == 0, 1, "GFX12 cntlValue leaves RB_EXE clear");
         checkEq(v & 0x3Fu, bufsz, "cntlValue keeps RB_BUFSZ");
         checkEq((v >> 8) & 0x3Fu, bufsz - 2, "cntlValue keeps RB_BLKSZ = bufsz-2");
     }
-    checkEq(MesApi::GfxHqd::cntlValue(17), 0x30F00F11u, "cntl for a 1 MiB ring");
+    checkEq(MesApi::GfxHqd::cntlValue(17), 0x00F00F11u, "GFX12 cntl for a 1 MiB ring");
 }
 
 static void testDoorbellWindows() {

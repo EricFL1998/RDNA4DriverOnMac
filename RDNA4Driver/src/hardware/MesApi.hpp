@@ -70,23 +70,19 @@ constexpr uint32_t kWptr = 0x1E91;
 constexpr uint32_t kMapped = 0x1E94;
 
 // CP_RB0_CNTL and CP_GFX_HQD_CNTL share the same field layout
-// (gc_12_0_0_sh_mask.h).  KMD_QUEUE marks the ring as a kernel queue: it is
-// what makes the CP fetch it with kernel (VMID 0) privileges.  Upstream sets
-// it on the kernel GFX ring; a ring without it is treated as a user queue and
-// is never fetched.
+// (gc_12_0_0_sh_mask.h). These constants name the bits; GFX12 leaves them clear.
 constexpr uint32_t kCntlKmdQueue = 1u << 29;
 constexpr uint32_t kCntlRbExe = 1u << 28;
 constexpr uint32_t kCntlRbNoUpdate = 1u << 27;
 constexpr uint32_t kCntlMinAvailSz3 = 3u << 20;
-constexpr uint32_t kCntlMinIbAvailSz3 = 3u << 22;   // regCP_*_CNTL_DEFAULT upper bits
+constexpr uint32_t kCntlMinIbAvailSz3 = 3u << 22;
 
-// regCP_GFX_HQD_CNTL_DEFAULT / regCP_RB0_CNTL defaults, the kernel flag and
-// RB_EXE.  RB_EXE is "ring buffer execute": the CP does not run a ring whose
-// CNTL has it clear, which is exactly the state both GFX paths shipped in.
+// gfx_v12_0_gfx_mqd_init starts with regCP_GFX_HQD_CNTL_DEFAULT and overrides
+// only RB_BUFSZ/RB_BLKSZ; KMD_QUEUE and RB_EXE are not set on this path.
 constexpr uint32_t kCntlDefault = 0x00F00000u;
 
 inline uint32_t cntlValue(uint32_t rbBufsz) {
-    return kCntlDefault | kCntlRbExe | kCntlKmdQueue | (rbBufsz & 0x3Fu) |
+    return kCntlDefault | (rbBufsz & 0x3Fu) |
            (((rbBufsz >= 2u ? rbBufsz - 2u : 0u) & 0x3Fu) << 8);
 }
 } // namespace GfxHqd
