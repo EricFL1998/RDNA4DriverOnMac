@@ -46,8 +46,7 @@ hackintosh/
 ├── navi48/                    # 上游参考代码库 (Cobalt64, MacKernelSDK)
 ├── navi48-native/             # 底层图形库源码 (Mesa RADV, metal2vulkan)
 ├── ssh-keys/                  # 调试机 SSH 访问凭证
-├── tests/                     # 自动化测试脚本
-└── archive/                   # 📦 历史文档与旧测试归档 (保持根目录整洁)
+└── tests/                     # 自动化测试脚本
 ```
 
 ---
@@ -107,7 +106,6 @@ make clean && make
 *   **驱动故障恢复指南**: [`docs/RECOVERY.md`](docs/RECOVERY.md)
 *   **超详细逆向预研报告**: [`docs/superpowers/specs/2026-10-28-rdna4-native-metal-comprehensive-report.md`](docs/superpowers/specs/2026-10-28-rdna4-native-metal-comprehensive-report.md)
 *   **离线编译器实施计划**: [`docs/superpowers/plans/2026-10-28-air2gfx12-offline-compiler.md`](docs/superpowers/plans/2026-10-28-air2gfx12-offline-compiler.md)
-*   **历史文档归档目录**: `archive/old-docs/`
 
 ---
 
