@@ -179,13 +179,13 @@ bool RDNA4Driver::start(IOService* provider) {
         // ring 失败不阻断启动，后续仍可走无 ring 的调试路径
     }
 
-    // 图形 (GFX) 队列。默认关闭：MES 的 ADD_QUEUE 用 pipe0/queue0，
-    // 而 compute 队列已经占用同一个槽，映射 GFX 队列会把 compute 队列顶掉
-    // （实测现象：compute 的 fence 到达但 WRITE_DATA 不再落盘）。
-    // 用 rdna4-gfx-queue=1 单独开启，便于继续定位槽位方案。
+    // 图形 (GFX) 队列默认关闭，用 rdna4-gfx-queue=1 开启。
+    // 本机 MES 固件的实测结论：带 map_legacy_kq 的 ADD_QUEUE 会被直接拒绝；
+    // 不带时只 ack、不下发 GFX HQD（HQD_ACTIVE 恒为 0），而且会顶掉同槽的
+    // compute 队列。要跑通需要补 MES 进程上下文（ADD_PROCESS + 页表）。
     uint32_t gfxQueueEnable = 0;
-    if (PE_parse_boot_argn("rdna4-gfx-queue", &gfxQueueEnable, sizeof(gfxQueueEnable)) &&
-        gfxQueueEnable != 0) {
+    (void)PE_parse_boot_argn("rdna4-gfx-queue", &gfxQueueEnable, sizeof(gfxQueueEnable));
+    if (gfxQueueEnable != 0) {
         if (!initGraphicsRing()) {
             LOG_ERROR("Graphics ring initialization failed (non-fatal)");
         }

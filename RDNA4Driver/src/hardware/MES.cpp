@@ -686,13 +686,20 @@ bool RDNA4Driver::mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
     pkt[22] = static_cast<uint32_t>(wptrAddr);
     pkt[23] = static_cast<uint32_t>(wptrAddr >> 32);
     pkt[28] = queueType;     // 0 = GFX, 1 = COMPUTE, 2 = SDMA
-    pkt[37] = (1u << 13);    // map_legacy_kq
-    // The completion fence must land on the page mesSubmitAndWait polls
-    // (mesStatusGpuAddr). A caller-supplied address makes a successful
-    // ADD_QUEUE look like a timeout.
+    // MES_AddQueue dword map (mes_v12_api_def.h): 38 = vm_context_cntl,
+    // 39 = flags, 40/41 = api_status. Writing the status address into 38/39
+    // put a VRAM address into `flags`, so map_legacy_kq (bit 13) was never
+    // set: compute queues still map through the non-legacy path, but a GFX
+    // queue is only loaded into the GFX HQD when this bit is present.
+    // Measured on this firmware: putting map_legacy_kq into the real flags
+    // dword (39) makes the MES reject ADD_QUEUE for *every* queue type, so the
+    // layout the working compute queue uses is kept here. The consequence is
+    // that a GFX queue is only ever added through the non-legacy path, which
+    // the firmware acks without loading the GFX HQD - see GraphicsQueue.cpp.
+    pkt[37] = (1u << 13);
     pkt[38] = static_cast<uint32_t>(mesStatusGpuAddr);
     pkt[39] = static_cast<uint32_t>(mesStatusGpuAddr >> 32);
-    pkt[40] = 1;             // api completion fence value
+    pkt[40] = 1;                 // api completion fence value
     pkt[41] = 0;
     pkt[50] = pipe;
     pkt[51] = queue;
