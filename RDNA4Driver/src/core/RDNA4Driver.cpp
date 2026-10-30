@@ -348,7 +348,10 @@ bool RDNA4Driver::identifyDevice() {
 
     deviceName = getDeviceNameForID(deviceID);
     // Published for the framebuffer, which reports it to system_profiler.
-    if (deviceName) setProperty("Device,Name", deviceName);
+    if (deviceName) {
+        setProperty("Device,Name", deviceName);
+        pciDevice->setProperty("Device,Name", deviceName);
+    }
 
     LOG_DEBUG(2, "Vendor ID: 0x%04x", vendorID);
     LOG_DEBUG(2, "Device ID: 0x%04x", deviceID);
@@ -1536,6 +1539,7 @@ bool RDNA4Driver::performGMCInit() {
     
     setProperty("GMC,VRAMStart", gmcContext.vramStart, 64);
     setProperty("GMC,VRAMSize", gmcContext.vramSize, 64);
+    pciDevice->setProperty("GMC,VRAMSize", gmcContext.vramSize, 64);
     
     return true;
 }

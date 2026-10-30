@@ -18,7 +18,7 @@ LDFLAGS = -arch x86_64 -target x86_64-apple-macos11.0 \
           -Wl,-no_deduplicate
 
 KEXT = build/RDNA4Framebuffer.kext
-OBJS = build/RDNA4Framebuffer.o build/kmod_info.o
+OBJS = build/RDNA4Framebuffer.o build/RDNA4FramebufferEdid.o build/kmod_info.o
 
 all: $(KEXT)
 
@@ -35,6 +35,11 @@ build/RDNA4Framebuffer.o: src/RDNA4Framebuffer.cpp
 	@mkdir -p build
 	@echo "Compiling RDNA4Framebuffer.cpp..."
 	$(CXX) $(CXXFLAGS) -c src/RDNA4Framebuffer.cpp -o build/RDNA4Framebuffer.o
+
+build/RDNA4FramebufferEdid.o: src/RDNA4FramebufferEdid.cpp src/RDNA4FramebufferEdid.hpp
+	@mkdir -p build
+	@echo "Compiling RDNA4FramebufferEdid.cpp..."
+	$(CXX) $(CXXFLAGS) -c src/RDNA4FramebufferEdid.cpp -o build/RDNA4FramebufferEdid.o
 
 build/kmod_info.o: src/kmod_info.c
 	@mkdir -p build

@@ -1,9 +1,13 @@
+#include "RDNA4FramebufferEdid.hpp"
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSData.h>
+#include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
 
 class RDNA4Framebuffer : public IOFramebuffer {
@@ -38,6 +42,10 @@ private:
 
     IOPhysicalAddress64 fbPhysBase { 0 };
     uint64_t fbLength { 0 };
+    // Whole-VRAM size reported by getVRAMRange(); the console framebuffer is
+    // only a small window inside it (2560x1440x4 bytes, which is what made
+    // system_profiler show "14 MB").
+    uint64_t vramBytes { 0 };
     uint32_t fbWidth { 0 };
     uint32_t fbHeight { 0 };
     uint32_t fbRowBytes { 0 };
@@ -130,6 +138,69 @@ bool RDNA4Framebuffer::start(IOService* provider) {
         return false;
     }
 
+    // The driver publishes hardware properties on this PCI provider, so reading
+    // them does not depend on which service completes registration first.
+    const char* deviceModel = nullptr;
+    char fallbackModel[48];
+    if (OSNumber* size = OSDynamicCast(OSNumber, pci->getProperty("GMC,VRAMSize"))) {
+        vramBytes = size->unsigned64BitValue();
+    }
+    if (OSString* name = OSDynamicCast(OSString, pci->getProperty("Device,Name"))) {
+        deviceModel = name->getCStringNoCopy();
+    }
+    if (!deviceModel) {
+        const uint32_t vd = pci->configRead32(kIOPCIConfigVendorID);
+        snprintf(fallbackModel, sizeof(fallbackModel), "Radeon (0x%04x:0x%04x)",
+                 vd & 0xFFFFu, (vd >> 16) & 0xFFFFu);
+        deviceModel = fallbackModel;
+    }
+
+    if (vramBytes) {
+        setProperty("VRAM,TotalMB", vramBytes >> 20, 64);
+        // About This Mac reads these off the GPU's IOPCIDevice, not off the
+        // framebuffer: "VRAM,totalMB" (32-bit, MiB) and "VRAM,totalsize" (an
+        // 8-byte OSData holding the size in bytes).
+        pci->setProperty("VRAM,totalMB", vramBytes >> 20, 32);
+        const uint64_t bytes = vramBytes;
+        if (OSData* size = OSData::withBytes(&bytes, sizeof(bytes))) {
+            pci->setProperty("VRAM,totalsize", size);
+            size->release();
+        }
+        IOLog("RDNA4Framebuffer: VRAM = %llu bytes (%llu MiB)\n",
+              vramBytes, vramBytes >> 20);
+    }
+
+    // system_profiler's "Chipset Model" is the `model` property of the
+    // IOPCIDevice; without it the GPU shows up only as vendor/device IDs.
+    pci->setProperty("model", deviceModel);
+    setProperty("model", deviceModel);
+
+    // The display's own name comes from its EDID, read over the display
+    // engine's I2C bus.  A failure here is non-fatal: the console framebuffer
+    // keeps working, macOS just shows a generic display name.
+    if (IOMemoryMap* bar5 = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5)) {
+        volatile uint32_t* mmio =
+            reinterpret_cast<volatile uint32_t*>(bar5->getVirtualAddress());
+        const uint64_t mmioBytes = bar5->getLength();
+        uint8_t edid[256];
+        uint32_t edidLen = 0, ddcLine = 0;
+        if (mmio && mmioBytes && rdna4fbReadEdid(mmio, mmioBytes, edid, &edidLen, &ddcLine)) {
+            if (OSData* d = OSData::withBytes(edid, edidLen)) {
+                setProperty("IODisplayEDID", d);
+                d->release();
+            }
+            if (OSData* d = OSData::withBytes(edid, 128)) {
+                char key[24];
+                snprintf(key, sizeof(key), "EDID,DDC%u", ddcLine);
+                setProperty(key, d);
+                d->release();
+            }
+        }
+        bar5->release();
+    } else {
+        IOLog("RDNA4Framebuffer: BAR5 not mappable, skipping EDID\n");
+    }
+
     IOLog("RDNA4Framebuffer: started\n");
     return true;
 }
@@ -155,6 +226,9 @@ IODeviceMemory* RDNA4Framebuffer::getApertureRange(IOPixelAperture aperture) {
 }
 
 IODeviceMemory* RDNA4Framebuffer::getVRAMRange() {
+    // This is the scanout descriptor (IOFramebufferSharedUserClient maps it),
+    // so it must stay the console framebuffer window, not the whole VRAM
+    // aperture.  The card's VRAM size is published on the IOPCIDevice instead.
     if (!fbPhysBase || !fbLength)
         return nullptr;
     return IODeviceMemory::withRange(fbPhysBase, fbLength);
