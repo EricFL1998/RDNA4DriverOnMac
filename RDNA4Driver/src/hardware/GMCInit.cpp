@@ -3,7 +3,7 @@
 #include "VramLayout.hpp"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
-// Phase 1.6: GMC (Graphics Memory Controller) 初始化
+// GMC (Graphics Memory Controller) 初始化
 // 目标：启用 MMHUB GART，让 GPU 能通过 GART aperture 访问系统内存。
 //
 // 页表必须位于 VRAM，并且 CONTEXT0_PAGE_TABLE_BASE_ADDR 接收的是

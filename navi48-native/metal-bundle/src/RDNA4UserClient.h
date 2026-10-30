@@ -42,4 +42,9 @@ void RDNA4GpuFree(RDNA4GpuLink* link, uint64_t gpuAddress);
 int RDNA4GpuSubmit(RDNA4GpuLink* link, const void* pm4, size_t bytes, uint64_t* fence);
 int RDNA4GpuWait(RDNA4GpuLink* link, uint64_t fence, uint64_t timeoutMs);
 
+// Same contract, but on the graphics (GFX) queue the MES mapped. Render
+// command buffers use these; compute keeps using the pair above.
+int RDNA4GpuSubmitGraphics(RDNA4GpuLink* link, const void* pm4, size_t bytes, uint64_t* fence);
+int RDNA4GpuWaitGraphics(RDNA4GpuLink* link, uint64_t fence, uint64_t timeoutMs);
+
 #endif /* RDNA4UserClient_h */

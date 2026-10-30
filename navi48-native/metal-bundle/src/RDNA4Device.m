@@ -300,25 +300,25 @@
 @end
 
 @implementation RDNA4Texture
-// Stub - full implementation in Phase 3.3+
+// Stub: 尚未实现，留待接入
 @end
 
 @implementation RDNA4Library
-// Stub - full implementation in Phase 3.3+
+// Stub: 尚未实现，留待接入
 @end
 
 @implementation RDNA4Function
-// Stub - full implementation in Phase 3.3+
+// Stub: 尚未实现，留待接入
 @end
 
 @implementation RDNA4ComputePipelineState
-// Stub - full implementation in Phase 3.3+
+// Stub: 尚未实现，留待接入
 @end
 
 @implementation RDNA4RenderPipelineState
-// Stub - full implementation in Phase 3.3+
+// Stub: 尚未实现，留待接入
 @end
 
 @implementation RDNA4ComputeCommandEncoder
-// Stub - full implementation in Phase 3.3+
+// Stub: 尚未实现，留待接入
 @end

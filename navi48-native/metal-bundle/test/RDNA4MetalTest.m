@@ -1,6 +1,6 @@
 //
 //  main.m
-//  RDNA4MetalTest - Phase 3.3 User-Space Test Application
+//  RDNA4MetalTest - Metal 对象层测试程序
 //
 //  Tests the complete Metal stack: Metal.framework -> RDNA4Metal.bundle -> RDNA4Driver.kext
 //
@@ -251,7 +251,7 @@ BOOL testMultipleDispatches(id<MTLDevice> device) {
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         NSLog(@"========================================");
-        NSLog(@"RDNA4 Metal Test - Phase 3.3");
+        NSLog(@"RDNA4 Metal Test");
         NSLog(@"========================================\n");
         
         // Get default device
@@ -288,7 +288,7 @@ int main(int argc, const char * argv[]) {
         if (allPassed) {
             NSLog(@"✅ ALL TESTS PASSED");
             NSLog(@"========================================");
-            NSLog(@"Phase 3.3 is FULLY FUNCTIONAL!");
+            NSLog(@"RDNA4 Metal object layer is FULLY FUNCTIONAL!");
             NSLog(@"User-space Metal applications can now");
             NSLog(@"submit compute work to RDNA4 GPU!");
             NSLog(@"========================================");

@@ -34,7 +34,7 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits* options,
                                  IOMemoryDescriptor** memory) override;
 
-    static const IOExternalMethodDispatch sMethods[5];
+    static const IOExternalMethodDispatch sMethods[8];
 
 protected:
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments* arguments,
@@ -54,6 +54,12 @@ private:
                                     IOExternalMethodArguments* arguments);
     static IOReturn sWaitFence(OSObject* target, void* reference,
                                IOExternalMethodArguments* arguments);
+    static IOReturn sSubmitGraphics(OSObject* target, void* reference,
+                                    IOExternalMethodArguments* arguments);
+    static IOReturn sWaitGraphicsFence(OSObject* target, void* reference,
+                                       IOExternalMethodArguments* arguments);
+    static IOReturn sGetGraphicsInfo(OSObject* target, void* reference,
+                                     IOExternalMethodArguments* arguments);
 };
 
 #endif /* RDNA4DriverUserClient_hpp */

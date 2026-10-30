@@ -1,4 +1,4 @@
-// Phase 3.3 end-to-end test without Metal's system loader:
+// End-to-end test of the Metal bundle without Metal's system loader:
 //   dlopen the bundle -> instantiate RDNA4Device -> newBufferWithLength
 //   -> write through buffer.contents -> GPU writes into the same VRAM via a
 //   raw PM4 WRITE_DATA -> read back through contents.

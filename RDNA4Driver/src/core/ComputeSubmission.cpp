@@ -3,7 +3,7 @@
 #include "../hardware/VramLayout.hpp"
 
 //==============================================================================
-// Phase 2.3: Compute ring and command submission
+// compute ring 与命令提交
 //
 // This file owns the driver-side compute ring orchestration. The low-level
 // ring buffer lives in ComputeRing.cpp (src/hardware).
@@ -58,13 +58,13 @@ bool RDNA4Driver::initComputeRing() {
         return false;
     }
 
-    // Phase 3.3: the user-visible window starts empty; the first user
+    // 用户可见窗口初始为空；首个用户
     // allocation seeds userHeapNext.
     userHeapNext = 0;
 
     computeHeapNext = VramLayout::kComputeHeap;
 
-    // Phase 2.4: give the ring to the CP/MEC queue. MQD, EOP and the rptr
+    // 把 ring 交给 CP/MEC 队列。MQD、EOP 与 rptr
     // writeback all live in the compute heap right above the ring.
     const uint64_t ringGpuAddr = gmcContext.vramStart + VramLayout::kComputeRing;
     const uint64_t mqdAddr = allocateVRAMBuffer(4096);
@@ -123,7 +123,7 @@ bool RDNA4Driver::initComputeRing() {
             }
             if (queueOk) {
                 queueOk = mesMapLegacyQueue(0, 0, doorbellIndex, mqdGpu,
-                                            computeWptrGpuAddr, statusAddr);
+                                            computeWptrGpuAddr, statusAddr, 1);
             }
         } else {
             LOG_ERROR("initComputeRing: MES buffer allocation failed");
@@ -192,15 +192,6 @@ uint64_t RDNA4Driver::allocateVRAMBuffer(size_t size) {
     uint64_t allocSize = (static_cast<uint64_t>(size) + alignment - 1) &
                          ~(alignment - 1);
 
-    // Reuse a released range when one is big enough; the bump pointer below
-    // only ever grows.
-    if (const uint64_t reused = vramFreeTake(allocSize)) {
-        LOG("allocateVRAMBuffer: reused %llu bytes at GPU 0x%llx",
-            static_cast<unsigned long long>(allocSize),
-            static_cast<unsigned long long>(reused));
-        return reused;
-    }
-
     // The kernel heap must stop at the user window: a user mapping of that
     // range would otherwise expose kernel-owned PSP/GFX buffers.
     const uint64_t heapCeiling = VramLayout::kUserHeap < vramSize
@@ -217,21 +208,18 @@ uint64_t RDNA4Driver::allocateVRAMBuffer(size_t size) {
     computeHeapNext += allocSize;
     const uint64_t gpuAddress = gmcContext.vramStart + vramOffset;
 
-    // Record the size so freeVRAMBuffer can release exactly this range.
     if (vramLiveBlockCount < kMaxVramBlocks) {
         vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
         vramLiveBlocks[vramLiveBlockCount].size = allocSize;
         vramLiveBlockCount++;
     } else {
-        LOG_ERROR("allocateVRAMBuffer: live-block table full (%u) — the address "
-                  "cannot be released later", kMaxVramBlocks);
+        LOG_ERROR("allocateVRAMBuffer: live-block table full (%u)", kMaxVramBlocks);
     }
 
     LOG("allocateVRAMBuffer: allocated %llu bytes at GPU 0x%llx (VRAM+0x%llx)",
         static_cast<unsigned long long>(allocSize),
         static_cast<unsigned long long>(gpuAddress),
         static_cast<unsigned long long>(vramOffset));
-
     return gpuAddress;
 }
 
@@ -249,32 +237,23 @@ uint64_t RDNA4Driver::userHeapSize() const {
 uint64_t RDNA4Driver::allocateUserVRAMBuffer(size_t size) {
     const uint64_t window = userHeapSize();
     if (!vram || window == 0 || size == 0) {
-        LOG_ERROR("allocateUserVRAMBuffer: no user window (size=%zu, window=%llu)",
-                  size, static_cast<unsigned long long>(window));
+        LOG_ERROR("allocateUserVRAMBuffer: no user window (size=%zu)", size);
         return 0;
     }
-
     constexpr uint64_t alignment = 0x1000;
     const uint64_t allocSize = (static_cast<uint64_t>(size) + alignment - 1) &
                                ~(alignment - 1);
-    if (allocSize < size) {
-        LOG_ERROR("allocateUserVRAMBuffer: size %zu overflows", size);
-        return 0;
-    }
+    if (allocSize < size) return 0;
 
-    if (const uint64_t reused = vramFreeTake(allocSize)) {
-        // Only hand back addresses that live inside the user window.
-        const uint64_t base = userHeapGpuAddr();
-        if (reused >= base && reused - base < window &&
-            allocSize <= window - (reused - base)) {
-            LOG("allocateUserVRAMBuffer: reused %llu bytes at GPU 0x%llx",
-                static_cast<unsigned long long>(allocSize),
-                static_cast<unsigned long long>(reused));
-            return reused;
-        }
-        // A kernel-side range leaked into the free list position; put it back
-        // and fall through to the bump pointer.
-        vramFreeInsert(reused, allocSize);
+    // Reuse a released range before bumping: the window is only 32 MiB, so a
+    // bump-only allocator runs dry after a few frames of alloc/free. vramFreeTake
+    // records the range in the live table, which is what freeVRAMBuffer needs.
+    const uint64_t reused = vramFreeTake(allocSize, true);
+    if (reused) {
+        LOG("allocateUserVRAMBuffer: %llu bytes reused at GPU 0x%llx",
+            static_cast<unsigned long long>(allocSize),
+            static_cast<unsigned long long>(reused));
+        return reused;
     }
 
     if (userHeapNext == 0) userHeapNext = VramLayout::kUserHeap;
@@ -409,10 +388,14 @@ bool RDNA4Driver::vramFreeInsert(uint64_t gpuAddr, uint64_t size) {
 }
 
 // First fit; a block larger than the request keeps its tail free.
-uint64_t RDNA4Driver::vramFreeTake(uint64_t size) {
+uint64_t RDNA4Driver::vramFreeTake(uint64_t size, bool userRegion) {
     for (uint32_t i = 0; i < vramFreeBlockCount; i++) {
         VramBlock& b = vramFreeBlocks[i];
         if (b.size < size) continue;
+        // Kernel heap and user window are disjoint: handing a kernel allocation
+        // out of the mapped window would expose it to user space.
+        const uint64_t windowStart = gmcContext.vramStart + VramLayout::kUserHeap;
+        if (userRegion ? (b.gpuAddr < windowStart) : (b.gpuAddr >= windowStart)) continue;
         const uint64_t addr = b.gpuAddr;
         if (b.size == size) {
             vramFreeBlocks[i] = vramFreeBlocks[--vramFreeBlockCount];

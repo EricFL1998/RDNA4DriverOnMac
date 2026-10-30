@@ -7,7 +7,7 @@
 
 bool RDNA4Driver::testVectorAdd() {
     LOG("======================================");
-    LOG("  Phase 2.3: Vector Add Test (FULL)");
+    LOG("  Vector Add Test (FULL)");
     LOG("======================================");
     
     // Test parameters

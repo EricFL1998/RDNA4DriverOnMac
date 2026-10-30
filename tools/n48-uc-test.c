@@ -1,4 +1,4 @@
-// User-space bring-up test for the RDNA4Driver user client (Phase 3.3 path).
+// User-space bring-up test for the RDNA4Driver user client.
 //
 //   1. open RDNA4Driver, GetDeviceInfo -> user window base/size
 //   2. IOConnectMapMemory64(type 0) -> map the window

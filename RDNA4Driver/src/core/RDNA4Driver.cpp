@@ -1,6 +1,6 @@
 //
 //  RDNA4Driver.cpp
-//  Phase 1: 基础驱动实现
+//  RDNA4Driver —— GFX12 显卡驱动主体
 //
 //  基于 Cobalt64 的 Navi48Bringup
 //
@@ -151,18 +151,18 @@ bool RDNA4Driver::start(IOService* provider) {
         return false;
     }
 
-    // Phase 1.2: IP Discovery
+    // IP Discovery: 读取硬件 IP 版本与寄存器基址
     if (!performIPDiscovery()) {
         LOG_ERROR("IP Discovery failed");
         releaseResources();
         return false;
     }
 
-    // Phase 1.5: NBIO Doorbell 初始化（在 GMC 之前，参考实现的 IHInit 阶段）
+    // NBIO doorbell 初始化（须在 GMC 之前，对应参考实现的 IHInit）
     // 添加了完整的错误检查和日志，失败时安全降级
     performNBIOInit();
 
-    // Phase 1.6: GMC (before PSP, to match reference order)
+    // GMC 初始化（在 PSP 之前，与参考实现的顺序一致）
     if (!performGMCInit()) {
         LOG_ERROR("GMC initialization failed");
         releaseResources();
@@ -173,13 +173,25 @@ bool RDNA4Driver::start(IOService* provider) {
     performSMUInit();
     performGFXInit();
     
-    // Phase 2.3: Initialize Compute Ring (after GFX is alive)
+    // 初始化 compute ring（GFX 已就绪之后）
     if (!initComputeRing()) {
         LOG_ERROR("Compute Ring initialization failed (non-fatal)");
-        // Continue anyway - ring is optional for Phase 2
+        // ring 失败不阻断启动，后续仍可走无 ring 的调试路径
     }
 
-    // Phase 2.4: optional end-to-end compute test (dmesg-only)
+    // 图形 (GFX) 队列。默认关闭：MES 的 ADD_QUEUE 用 pipe0/queue0，
+    // 而 compute 队列已经占用同一个槽，映射 GFX 队列会把 compute 队列顶掉
+    // （实测现象：compute 的 fence 到达但 WRITE_DATA 不再落盘）。
+    // 用 rdna4-gfx-queue=1 单独开启，便于继续定位槽位方案。
+    uint32_t gfxQueueEnable = 0;
+    if (PE_parse_boot_argn("rdna4-gfx-queue", &gfxQueueEnable, sizeof(gfxQueueEnable)) &&
+        gfxQueueEnable != 0) {
+        if (!initGraphicsRing()) {
+            LOG_ERROR("Graphics ring initialization failed (non-fatal)");
+        }
+    }
+
+    // 可选的自检 compute 提交（只打印到 dmesg）
     uint32_t computeTest = 0;
     if (PE_parse_boot_argn("rdna4-compute-test", &computeTest, sizeof(computeTest)) &&
         computeTest != 0) {
@@ -236,7 +248,13 @@ void RDNA4Driver::releaseResources() {
     freeDiscovery();
     gmcFini(gmcContext);
     
-    // Phase 2.3: Cleanup compute ring
+    if (graphicsRing) {
+        delete graphicsRing;
+        graphicsRing = nullptr;
+    }
+    graphicsQueueMapped = false;
+
+    // 释放 compute ring
     if (computeRing) {
         delete computeRing;
         computeRing = nullptr;
@@ -368,12 +386,12 @@ bool RDNA4Driver::mapBARs() {
         return false;
     }
 
-    // BAR0 - VRAM (可选，Phase 1)
+    // BAR0 - VRAM（可选）
     if (!mapVRAM()) {
         LOG("Warning: Failed to map BAR0 (VRAM) - continuing");
     }
 
-    // BAR2 - Doorbell (可选，Phase 1)
+    // BAR2 - Doorbell（可选）
     if (!mapDoorbells()) {
         LOG("Warning: Failed to map BAR2 (doorbells) - continuing");
     }
@@ -514,8 +532,8 @@ bool RDNA4Driver::probeGPU() {
 }
 
 bool RDNA4Driver::readBasicInfo() {
-    // Phase 1: 基础信息读取
-    // 后续 Phase 会实现 IP Discovery
+    // 基础信息读取
+    // IP Discovery 在 start() 中完成
     return true;
 }
 
@@ -592,7 +610,7 @@ void RDNA4Driver::writeRegister(uint32_t offset, uint32_t value) {
 }
 
 //==============================================================================
-// Phase 1.2: IP Discovery
+// IP Discovery
 //==============================================================================
 
 static constexpr uint32_t kDiscoveryTmrSize = 10 << 10;
@@ -821,7 +839,7 @@ void RDNA4Driver::performNBIOInit() {
 }
 
 void RDNA4Driver::performPSPInit() {
-    // Phase 3: 需要 rdna4-psp=1 启用（用于逐步调试）
+    // 需要 rdna4-psp=1 启用（用于逐步调试）
     uint32_t enabled = 0;
     if (!PE_parse_boot_argn("rdna4-psp", &enabled, sizeof(enabled)) || enabled == 0) {
         LOG("PSP init skipped (set rdna4-psp=1 to test)");
@@ -918,7 +936,7 @@ private:
 }
 
 void RDNA4Driver::performSMUInit() {
-    // Phase 3: 需要 rdna4-smu=1 启用（用于逐步调试）
+    // 需要 rdna4-smu=1 启用（用于逐步调试）
     uint32_t enabled = 0;
     if (!PE_parse_boot_argn("rdna4-smu", &enabled, sizeof(enabled)) || enabled == 0) {
         LOG("SMU init skipped (set rdna4-smu=1 to test)");
@@ -990,7 +1008,7 @@ void RDNA4Driver::performSMUInit() {
     setProperty("SMU,InterfaceVersion", static_cast<uint64_t>(interfaceVersion), 32);
     LOG("SMU alive: firmware 0x%08x interface 0x%08x", version, interfaceVersion);
     
-    // Phase 2: 完整的 SMU hw_setup 流程
+    // 完整的 SMU hw_setup 流程
     performSMUSetup();
 }
 
@@ -1197,7 +1215,7 @@ void RDNA4Driver::programMecStartAddress() {
 }
 
 void RDNA4Driver::performGFXInit() {
-    // Phase 3: 需要 rdna4-gfx=1 启用（用于逐步调试）
+    // 需要 rdna4-gfx=1 启用（用于逐步调试）
     uint32_t enabled = 0;
     if (!PE_parse_boot_argn("rdna4-gfx", &enabled, sizeof(enabled)) || enabled == 0) {
         LOG("GFX init skipped (set rdna4-gfx=1 to test)");
@@ -1468,7 +1486,7 @@ void RDNA4Driver::performGFXInit() {
 
 
 //==============================================================================
-// Phase 1.6: GMC 初始化
+// GMC 初始化
 //==============================================================================
 
 extern bool gmcInit(RDNA4Driver& driver, GMCContext& gmc);
@@ -1494,7 +1512,7 @@ bool RDNA4Driver::performGMCInit() {
 
 bool RDNA4Driver::testVectorAdd() {
     LOG("======================================");
-    LOG("  Phase 2.3: Vector Add Test (FULL)");
+    LOG("  Vector Add Test (FULL)");
     LOG("======================================");
 
     if (!computeRing) {

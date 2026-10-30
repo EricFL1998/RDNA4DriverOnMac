@@ -8,7 +8,7 @@
  * ComputeRing - GFX Compute Ring Buffer Manager
  * 
  * Manages the GPU compute command ring buffer for submitting PM4 packets.
- * Phase 2.3: Basic ring write and fence synchronization.
+ * 基础 ring 写入与 fence 同步。
  */
 class ComputeRing {
 public:

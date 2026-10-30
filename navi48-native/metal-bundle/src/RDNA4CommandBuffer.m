@@ -10,6 +10,7 @@
     MTLCommandBufferStatus _status;
     NSMutableArray<RDNA4ComputeCommandEncoder*>* _encoders;
     NSMutableData* _allCommands;
+    BOOL _usesGraphicsQueue;
     uint64_t _fenceValue;
     dispatch_semaphore_t _completionSemaphore;
 }
@@ -107,7 +108,10 @@
     // The driver allocates the fence value and appends the RELEASE_MEM packet
     // itself; a user-space counter here could never match the GPU's slot.
     uint64_t fence = 0;
-    if (RDNA4GpuSubmit(link, _allCommands.bytes, _allCommands.length, &fence) != 0) {
+    const int submitted = _usesGraphicsQueue
+        ? RDNA4GpuSubmitGraphics(link, _allCommands.bytes, _allCommands.length, &fence)
+        : RDNA4GpuSubmit(link, _allCommands.bytes, _allCommands.length, &fence);
+    if (submitted != 0) {
         NSLog(@"RDNA4CommandBuffer: command submission failed");
         _status = MTLCommandBufferStatusError;
         [self notifyCompletion];
@@ -116,7 +120,9 @@
     _fenceValue = fence;
 
     // Timeout is milliseconds, matching the driver's WaitFence contract.
-    if (RDNA4GpuWait(link, fence, 5000) == 0) {
+    const int waited = _usesGraphicsQueue ? RDNA4GpuWaitGraphics(link, fence, 5000)
+                                          : RDNA4GpuWait(link, fence, 5000);
+    if (waited == 0) {
         _status = MTLCommandBufferStatusCompleted;
     } else {
         NSLog(@"RDNA4CommandBuffer: fence %llu did not complete", (unsigned long long)fence);
@@ -197,5 +203,19 @@
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {}
 - (void)pushDebugGroup:(NSString*)string {}
 - (void)popDebugGroup {}
+
+
+- (void)appendCommands:(const void*)bytes length:(NSUInteger)length {
+    if (!bytes || length == 0) return;
+    [_allCommands appendBytes:bytes length:length];
+}
+
+// Render streams belong to the GFX queue; compute streams stay on the MES queue
+// the driver started first.
+- (void)appendRenderCommands:(const void*)bytes length:(NSUInteger)length {
+    if (!bytes || length == 0) return;
+    [_allCommands appendBytes:bytes length:length];
+    _usesGraphicsQueue = YES;
+}
 
 @end

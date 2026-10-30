@@ -4,7 +4,7 @@
 #include <IOKit/IOLib.h>
 
 //==============================================================================
-// Phase 2.4: CP/MEC compute queue
+// CP/MEC compute queue
 //
 // Ports the kernel-queue bring-up path from Linux gfx_v12_0.c:
 //   gfx_v12_0_compute_mqd_init()  - fills the MQD page

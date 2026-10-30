@@ -32,7 +32,10 @@ CPP_SOURCES = $(SRC_DIR)/core/RDNA4Driver.cpp \
 		$(SRC_DIR)/hardware/ComputeRing.cpp \
 		$(SRC_DIR)/hardware/ComputeQueue.cpp \
 		$(SRC_DIR)/hardware/MES.cpp \
-		$(SRC_DIR)/hardware/PM4BuilderKernel.cpp
+		$(SRC_DIR)/hardware/PM4BuilderKernel.cpp \
+		$(SRC_DIR)/hardware/GraphicsPM4Builder.cpp \
+		$(SRC_DIR)/hardware/GraphicsRing.cpp \
+		$(SRC_DIR)/hardware/GraphicsQueue.cpp
 C_SOURCES = $(SRC_DIR)/kmod_info.c
 
 # Object files
@@ -71,7 +74,7 @@ LDFLAGS = -arch $(ARCH) -target $(ARCH)-apple-macos11.0 \
 	-Wl,-no_deduplicate
 
 # Targets
-.PHONY: all clean install unload status
+.PHONY: all clean install unload status test-pm4
 
 all: $(KEXT_DIR)
 
@@ -108,6 +111,14 @@ $(KEXT_DIR): $(OBJECTS)
 clean:
 	@echo "Cleaning build files..."
 	rm -rf $(BUILD_DIR)
+
+# Host-side packet checks for the graphics encoder. No hardware, no IOKit.
+test-pm4:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(CXX) -std=c++17 -Wall -Wextra -I$(SRC_DIR)/hardware \
+		$(SRC_DIR)/hardware/GraphicsPM4Builder.cpp tests/test_graphics_pm4.cpp \
+		-o $(BUILD_DIR)/tests/test_graphics_pm4
+	./$(BUILD_DIR)/tests/test_graphics_pm4
 
 install: $(KEXT_DIR)
 	@echo "Installing kext to /Library/Extensions..."

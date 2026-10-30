@@ -5,7 +5,7 @@
  * RDNA4Device - Native Metal Device Implementation for AMD RDNA4 GPUs
  * 
  * This is a stub implementation that conforms to MTLDevice protocol.
- * Phase 3.2 skeleton - actual GPU communication happens in Phase 3.3+
+ * 设备对象骨架；实际的 GPU 通信经 user client 完成
  */
 @interface RDNA4Device : NSObject <MTLDevice>
 
@@ -86,6 +86,8 @@
 
 - (void)encoderDidEnd:(id)encoder;
 - (void)appendCommands:(const void*)bytes length:(NSUInteger)length;
+// Render commands go to the GFX queue, compute commands to the MES queue.
+- (void)appendRenderCommands:(const void*)bytes length:(NSUInteger)length;
 
 @end
 
@@ -110,30 +112,11 @@
 
 @end
 
-/**
- * RDNA4Texture - Texture implementation
- */
-@interface RDNA4Texture : NSObject <MTLTexture>
-
-@property (readonly) id<MTLDevice> device;
-@property (copy) NSString* label;
-@property (readonly) MTLTextureType textureType;
-@property (readonly) MTLPixelFormat pixelFormat;
-@property (readonly) NSUInteger width;
-@property (readonly) NSUInteger height;
-@property (readonly) NSUInteger depth;
-
-@end
-
-/**
- * RDNA4RenderPipelineState - Render pipeline state
- */
-@interface RDNA4RenderPipelineState : NSObject <MTLRenderPipelineState>
-
-@property (readonly) id<MTLDevice> device;
-@property (copy) NSString* label;
-
-@end
+// RDNA4Texture and RDNA4RenderPipelineState are real classes now; declaring
+// stubs here as well would make every translation unit that includes both
+// headers see two interfaces for the same name.
+@class RDNA4Texture;
+@class RDNA4RenderPipelineState;
 
 // Per-class headers own the remaining declarations.
 #import "RDNA4Library.h"

@@ -67,4 +67,11 @@
 @property (nonatomic, assign) uint32_t computePgmRsrc1;
 @property (nonatomic, assign) uint32_t computePgmRsrc2;
 
+// Graphics-stage resource registers (SPI_SHADER_PGM_RSRC1/2_*). These are a
+// different encoding from the compute pair above and have to come out of the
+// shader compiler; 0 means "metadata not available yet", and the render
+// encoder refuses to program a stage that has none rather than guessing.
+@property (nonatomic, assign) uint32_t pgmRsrc1;
+@property (nonatomic, assign) uint32_t pgmRsrc2;
+
 @end

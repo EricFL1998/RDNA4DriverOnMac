@@ -1,6 +1,6 @@
 //
 //  RDNA4Driver.hpp
-//  Phase 1: 基础驱动框架
+//  RDNA4Driver —— 驱动类定义
 //
 //  目标: 设备识别和基本 PCI 访问
 //
@@ -16,6 +16,7 @@
 #include "../hardware/PSPLoader.hpp"
 #include "../hardware/GMCContext.hpp"
 #include "../hardware/ComputeRing.hpp"
+#include "../hardware/GraphicsRing.hpp"
 
 // 版本信息
 #define RDNA4_VERSION_MAJOR 0
@@ -77,7 +78,7 @@ public:
     const char* getDeviceName() const { return deviceName; }
 
 private:
-    // Phase 1.2: IP Discovery
+    // IP Discovery
     IPDiscovery ipDiscovery;
     uint8_t* onDieDisc { nullptr };
     bool performIPDiscovery();
@@ -89,11 +90,11 @@ private:
     uint32_t vramRead32(uint64_t pos);
     void freeDiscovery();
 
-    // Phase 1.6: GMC
+    // GMC
     GMCContext gmcContext;
     bool performGMCInit();
     
-    // Phase 2.3: Compute Ring
+    // Compute ring
     ComputeRing* computeRing { nullptr };
     uint64_t computeHeapNext { 0 };
     uint64_t computeMqdGpuAddr { 0 };
@@ -110,10 +111,10 @@ private:
     VramBlock vramFreeBlocks[kMaxVramBlocks];
     uint32_t vramFreeBlockCount { 0 };
     bool vramFreeInsert(uint64_t gpuAddr, uint64_t size);
-    uint64_t vramFreeTake(uint64_t size);
+    uint64_t vramFreeTake(uint64_t size, bool userRegion);
     void vramBlocksReset();
 
-    // Phase 3.3 user window bump pointer (see VramLayout::kUserHeap).
+    // 用户可见窗口的 bump 指针（见 VramLayout::kUserHeap）。
     uint64_t userHeapNext { 0 };
 
     // Serialises ring writes: two clients submitting at once would interleave
@@ -124,10 +125,10 @@ private:
     bool computeQueueViaMes { false };
     bool initComputeRing();
     
-    // Phase 2.3: First Compute Kernel submission
+    // 首次 compute kernel 提交
     bool testVectorAdd();
 
-    // Phase 2.4: CP/MEC compute queue (MQD + HQD programming)
+    // CP/MEC compute 队列（MQD + HQD 编程）
     bool initComputeQueue(uint64_t ringGpuAddr, uint32_t ringSizeBytes,
                           uint64_t mqdGpuAddr, uint64_t eopGpuAddr,
                           uint64_t rptrGpuAddr, uint32_t doorbellIndex);
@@ -136,13 +137,14 @@ private:
                      uint32_t doorbellIndex);
     bool enableCpGfx();
 
-    // Phase 2.5: MES (mandatory scheduler on GFX12)
+    // MES（GFX12 上必需的调度器）
     bool mesInit();
     bool mesSubmitAndWait(uint32_t pipe, const uint32_t* pkt, uint32_t dwords,
                           uint64_t statusGpuAddr);
     bool mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
                            uint32_t doorbellOffset, uint64_t mqdAddr,
-                           uint64_t wptrAddr, uint64_t statusAddr);
+                           uint64_t wptrAddr, uint64_t statusAddr,
+                           uint32_t queueType = 1 /* COMPUTE */);
     uint64_t mesRingGpuAddr[2] { 0, 0 };
     uint32_t mesRingDwords[2] { 0, 0 };
     uint32_t mesRingWrite[2] { 0, 0 };
@@ -195,6 +197,21 @@ private:
     void refreshRingReadPtr();
     uint64_t mesUcStart { 0 };
     uint64_t computeWptrGpuAddr { 0 };
+
+    // ---- 图形队列状态 ----
+    GraphicsRing* graphicsRing { nullptr };
+    IOBufferMemoryDescriptor* graphicsMqdMd { nullptr };
+    IOBufferMemoryDescriptor* graphicsWptrMd { nullptr };
+    uint64_t graphicsRingGpuAddr { 0 };
+    uint64_t graphicsWptrGpuAddr { 0 };
+    uint64_t graphicsRptrGpuAddr { 0 };
+    // 0x20 belongs to the compute queue on this card, so the GFX ring takes
+    // the next free dword slot.
+    uint32_t graphicsDoorbellIndex { 0x40 };
+    bool graphicsQueueMapped { false };
+    IOLock* graphicsLock { nullptr };
+    uint32_t graphicsRbBufsz { 0 };
+    uint32_t graphicsHqdActive { 0 };
     bool activateComputeQueue();
     bool deactivateComputeQueue();
     bool enableMecRs64Pipes();
@@ -286,17 +303,17 @@ private:
     // GFX 固件是否已由本次驱动实例成功提交（不能复用 PSP,Stage 判断）
     bool                gfxFirmwareLoaded { false };
     
-    // Phase 2.3: Public API for buffer allocation and command submission
+    // 缓冲分配与命令提交的公开 API
 public:
     // Allocate buffer in VRAM (returns GPU address)
     uint64_t allocateVRAMBuffer(size_t size);
 
-    // Phase 3.3: one PM4 submission, serialised against other submitters.
+    // 一次 PM4 提交，与其他提交者串行化。
     // Returns false when the ring could not accept the stream.
     bool submitComputeCommands(const uint32_t* pm4Data, size_t dwordCount);
     bool submitComputeCommandsLocked(const uint32_t* pm4Data, size_t dwordCount);
 
-    // Phase 3.3: allocate inside the user-visible window only. A user-space
+    // 只在用户可见窗口内分配。用户态
     // client may map that window and nothing else, so handing out any other
     // VRAM address here would be a privilege escape.
     uint64_t allocateUserVRAMBuffer(size_t size);
@@ -311,10 +328,20 @@ public:
     // Wait for compute completion
     bool waitForComputeFence(uint64_t fenceValue, uint64_t timeoutMS);
 
-    // Phase 3.3: the driver owns the fence counter, so user space never has to
+    // fence 计数由驱动持有，用户态无需
     // guess a value the GPU will write.
     uint64_t allocFenceValue();
     uint64_t computeFenceGpuAddr();
+
+    // ---- 图形 (GFX) 队列 ----
+    // MES 把 GFX pipe0/queue0 映射到我们的 ring 上（map_legacy_kq），
+    // 之后所有绘制命令都走这条队列。
+    bool initGraphicsRing();
+    bool submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCount);
+    bool waitForGraphicsFence(uint64_t fenceValue, uint64_t timeoutMS);
+    uint64_t allocGraphicsFence();
+    uint64_t graphicsFenceGpuAddr();
+    bool graphicsQueueReady() const { return graphicsQueueMapped; }
 
     virtual IOReturn newUserClient(task_t owningTask, void* securityID,
                                    UInt32 type, IOUserClient** handler) override;

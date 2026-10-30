@@ -26,8 +26,21 @@ OBJC_SOURCES = \
 	$(SRC_DIR)/RDNA4CommandBuffer.m \
 	$(SRC_DIR)/RDNA4ComputeCommandEncoder.m
 
+# Graphics (render) sources: the encoder now shares the driver's PM4 encoder.
+GFX_ENCODER_DIR = $(abspath $(SRC_DIR)/../../../RDNA4Driver/src/hardware)
+
+OBJC_GRAPHICS_SOURCES = \
+	$(SRC_DIR)/graphics/RDNA4RenderCommandEncoder.m \
+	$(SRC_DIR)/graphics/RDNA4Texture.m \
+	$(SRC_DIR)/graphics/RDNA4RenderPipelineState.m \
+	$(SRC_DIR)/graphics/RDNA4RenderPipelineDescriptor.m \
+	$(SRC_DIR)/graphics/RDNA4RenderPassDescriptor.m \
+	$(SRC_DIR)/graphics/RDNA4VertexDescriptor.m
+
 # Object files
 OBJC_OBJECTS = $(OBJC_SOURCES:$(SRC_DIR)/%.m=$(BUILD_DIR)/%.o)
+GRAPHICS_OBJECTS = $(OBJC_GRAPHICS_SOURCES:$(SRC_DIR)/%.m=$(BUILD_DIR)/%.o)
+CXX_OBJECTS = $(BUILD_DIR)/graphics/RDNA4RenderPM4Builder.o $(BUILD_DIR)/gfx/GraphicsPM4Builder.o
 
 # Compiler
 CC = clang
@@ -37,10 +50,12 @@ CFLAGS = -Wall -Wextra -std=c11 -O2 -arch $(ARCH) \
 	-framework Foundation \
 	-framework Metal \
 	-framework IOKit \
+	-framework IOSurface \
 	-dynamiclib \
+	-lc++ \
 	-install_name /Library/GPUBundles/$(BUNDLE_NAME).bundle/Contents/MacOS/$(BUNDLE_NAME) \
 	-fobjc-arc \
-	-I$(SRC_DIR)
+	-I$(SRC_DIR) -I$(SRC_DIR)/graphics -I$(GFX_ENCODER_DIR)
 
 # AIRNT plugin dependency
 AIRNT_PLUGIN = ../airnt-plugin/libAMDNTPlugin.dylib
@@ -52,16 +67,31 @@ all: bundle
 bundle: $(BUNDLE_DIR) $(MACOS)/$(BUNDLE_NAME) $(CONTENTS)/Info.plist $(MACOS)/libAMDNTPlugin.dylib
 
 # Build main library
-$(MACOS)/$(BUNDLE_NAME): $(OBJC_OBJECTS)
+$(MACOS)/$(BUNDLE_NAME): $(OBJC_OBJECTS) $(GRAPHICS_OBJECTS) $(CXX_OBJECTS)
 	@echo "Linking $(BUNDLE_NAME)..."
-	$(CC) $(CFLAGS) -o $@ $(OBJC_OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $(OBJC_OBJECTS) $(GRAPHICS_OBJECTS) $(CXX_OBJECTS)
 	@echo "✅ Built $(BUNDLE_NAME)"
 
 # Compile Objective-C sources
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.m
-	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	@echo "Compiling $<..."
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# Objective-C++ and C++ objects (the shared PM4 encoder)
+CXXFLAGS_BUNDLE = -Wall -O2 -arch $(ARCH) -fobjc-arc -std=c++17 \
+	-fno-exceptions -fno-rtti \
+	-I$(SRC_DIR) -I$(SRC_DIR)/graphics -I$(GFX_ENCODER_DIR)
+
+$(BUILD_DIR)/graphics/RDNA4RenderPM4Builder.o: $(SRC_DIR)/graphics/RDNA4RenderPM4Builder.mm
+	@mkdir -p $(dir $@)
+	@echo "Compiling $<..."
+	$(CC) $(CXXFLAGS_BUNDLE) -c $< -o $@
+
+$(BUILD_DIR)/gfx/GraphicsPM4Builder.o: $(GFX_ENCODER_DIR)/GraphicsPM4Builder.cpp
+	@mkdir -p $(dir $@)
+	@echo "Compiling shared encoder $<..."
+	$(CC) $(CXXFLAGS_BUNDLE) -c $< -o $@
 
 # Create bundle directory
 $(BUNDLE_DIR):

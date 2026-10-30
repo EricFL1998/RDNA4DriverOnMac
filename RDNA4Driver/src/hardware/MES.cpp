@@ -5,7 +5,7 @@
 #include <libkern/c++/OSData.h>
 
 //==============================================================================
-// Phase 2.5: MES (Micro Engine Scheduler)
+// MES (Micro Engine Scheduler)
 //
 // GFX12 (GC 12.0.x) always initializes MES: amdgpu_discovery.c adds the
 // mes_v12_0 IP block and sets enable_mes = true unconditionally.  MES owns the
@@ -674,7 +674,8 @@ bool RDNA4Driver::mesSubmitAndWait(uint32_t pipe, const uint32_t* pkt,
 
 bool RDNA4Driver::mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
                                     uint32_t doorbellOffset, uint64_t mqdAddr,
-                                    uint64_t wptrAddr, uint64_t statusAddr) {
+                                    uint64_t wptrAddr, uint64_t statusAddr,
+                                    uint32_t queueType) {
     (void)statusAddr;
     uint32_t pkt[64] = {};
 
@@ -684,7 +685,7 @@ bool RDNA4Driver::mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
     pkt[21] = static_cast<uint32_t>(mqdAddr >> 32);
     pkt[22] = static_cast<uint32_t>(wptrAddr);
     pkt[23] = static_cast<uint32_t>(wptrAddr >> 32);
-    pkt[28] = 1;             // MES_QUEUE_TYPE_COMPUTE
+    pkt[28] = queueType;     // 0 = GFX, 1 = COMPUTE, 2 = SDMA
     pkt[37] = (1u << 13);    // map_legacy_kq
     // The completion fence must land on the page mesSubmitAndWait polls
     // (mesStatusGpuAddr). A caller-supplied address makes a successful
@@ -701,14 +702,24 @@ bool RDNA4Driver::mesMapLegacyQueue(uint32_t pipe, uint32_t queue,
         static_cast<unsigned long long>(mqdAddr),
         static_cast<unsigned long long>(wptrAddr));
 
-    // mes_v12_0_map_legacy_queue(): with uni-MES the API goes to the KIQ pipe
-    // (1), without uni-MES to the SCHED pipe (0).  Try KIQ first, then SCHED.
-    bool ok = mesSubmitAndWait(1, pkt, 64, statusAddr);
-    setProperty("MES,KiqPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
-    if (!ok) {
+    // mes_v12_0_map_legacy_queue(): with uni-MES the ADD_QUEUE for a *compute*
+    // queue goes to the KIQ pipe (1).  A GFX queue belongs to the scheduler
+    // pipe (0): the KIQ acks the request and then leaves the GFX HQD
+    // un-activated, which looks like success until nothing executes.
+    bool ok;
+    if (queueType == 0) {
         ok = mesSubmitAndWait(0, pkt, 64, statusAddr);
+        setProperty("MES,SchedPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
+        if (!ok) ok = mesSubmitAndWait(1, pkt, 64, statusAddr);
+        setProperty("MES,KiqPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
+    } else {
+        ok = mesSubmitAndWait(1, pkt, 64, statusAddr);
+        setProperty("MES,KiqPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
+        if (!ok) {
+            ok = mesSubmitAndWait(0, pkt, 64, statusAddr);
+        }
+        setProperty("MES,SchedPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
     }
-    setProperty("MES,SchedPipeOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
     setProperty("MES,MapQueueOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
 
     if (!ok) {

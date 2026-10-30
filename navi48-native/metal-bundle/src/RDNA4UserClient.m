@@ -8,6 +8,8 @@ enum {
     kSelectorFreeBuffer = 2,
     kSelectorSubmitCommands = 3,
     kSelectorWaitFence = 4,
+    kSelectorSubmitGraphics = 5,
+    kSelectorWaitGraphicsFence = 6,
     kMemoryTypeUserWindow = 0,
 };
 
@@ -116,6 +118,26 @@ int RDNA4GpuWait(RDNA4GpuLink* link, uint64_t fence, uint64_t timeoutMs) {
     if (!link || !link->connection) return -1;
     uint64_t inputs[2] = { fence, timeoutMs ? timeoutMs : 5000 };
     kern_return_t kr = IOConnectCallMethod(link->connection, kSelectorWaitFence,
+                                           inputs, 2, NULL, 0, NULL, NULL, NULL, NULL);
+    return kr == KERN_SUCCESS ? 0 : -1;
+}
+
+int RDNA4GpuSubmitGraphics(RDNA4GpuLink* link, const void* pm4, size_t bytes, uint64_t* fence) {
+    if (!link || !link->connection || !pm4 || bytes == 0) return -1;
+    uint64_t output = 0;
+    uint32_t count = 1;
+    kern_return_t kr = IOConnectCallMethod(link->connection, kSelectorSubmitGraphics,
+                                           NULL, 0, pm4, bytes,
+                                           &output, &count, NULL, NULL);
+    if (kr != KERN_SUCCESS) return -1;
+    if (fence) *fence = output;
+    return 0;
+}
+
+int RDNA4GpuWaitGraphics(RDNA4GpuLink* link, uint64_t fence, uint64_t timeoutMs) {
+    if (!link || !link->connection) return -1;
+    uint64_t inputs[2] = { fence, timeoutMs ? timeoutMs : 5000 };
+    kern_return_t kr = IOConnectCallMethod(link->connection, kSelectorWaitGraphicsFence,
                                            inputs, 2, NULL, 0, NULL, NULL, NULL, NULL);
     return kr == KERN_SUCCESS ? 0 : -1;
 }

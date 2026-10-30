@@ -31,7 +31,7 @@ constexpr uint32_t kSmuDriverTableSize = 64U * 1024U;
 constexpr uint64_t kGartTable = 128ULL * kMiB;
 constexpr uint64_t kGartSize  = 512ULL * kMiB;
 
-// Compute ring (Phase 2.3). The ring and fence must stay clear of the PSP
+// Compute ring。ring 与 fence 必须避开 PSP
 // staging window (64..68 MiB), GFX staging (71..88 MiB), the SMU driver
 // table (96 MiB) and the GART page table (128 MiB).
 constexpr uint64_t kComputeRing     = 192ULL * kMiB;
@@ -39,7 +39,7 @@ constexpr uint64_t kComputeRingSize = 1ULL * kMiB;
 constexpr uint64_t kComputeFence    = kComputeRing + kComputeRingSize;
 constexpr uint64_t kComputeHeap     = 194ULL * kMiB;
 
-// Phase 3.3 user-visible window. This is the only VRAM range a user-space
+// 用户可见窗口。这是用户态唯一能拿到的 VRAM 区段：
 // client is allowed to map (IOUserClient::clientMemoryForType), so it sits far
 // above the kernel-side compute heap: PSP/GFX/GART and the kernel's own buffers
 // must never be reachable from user space.
