@@ -124,8 +124,9 @@ bool RDNA4Driver::start(IOService* provider) {
     // Serialises PM4 submission; user-space and kernel-side tests share the ring.
     if (!submitLock) submitLock = IOLockAlloc();
     if (!graphicsLock) graphicsLock = IOLockAlloc();
-    if (!submitLock || !graphicsLock) {
-        LOG_ERROR("Failed to allocate submission locks");
+    if (!vramLock) vramLock = IOLockAlloc();
+    if (!submitLock || !graphicsLock || !vramLock) {
+        LOG_ERROR("Failed to allocate submission/VRAM locks");
         releaseResources();
         return false;
     }
@@ -290,6 +291,11 @@ void RDNA4Driver::releaseResources() {
     computeHeapNext = 0;
     userHeapNext = 0;
     vramBlocksReset();
+
+    if (vramLock) {
+        IOLockFree(vramLock);
+        vramLock = nullptr;
+    }
 
     if (submitLock) {
         IOLockFree(submitLock);

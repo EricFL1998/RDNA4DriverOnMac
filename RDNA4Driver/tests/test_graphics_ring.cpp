@@ -60,9 +60,36 @@ static void testDoorbellLandsAtDwordIndex() {
     checkEq(untouched, 0, "no other doorbell dword touched");
 }
 
+static void testResetRewindsRing() {
+    printf("\n[queue reset recovery]\n");
+    alignas(4096) static uint8_t vram[64 * 1024];
+    alignas(8) static uint32_t bar2[1024];
+    memset(vram, 0, sizeof(vram));
+    memset(bar2, 0, sizeof(bar2));
+
+    GraphicsRing ring;
+    const bool ok = ring.init(vram, sizeof(vram), bar2, 0x116,
+                              0, 16 * 1024, 32 * 1024);
+    checkEq(ok ? 1 : 0, 1, "ring init");
+    const uint32_t pm4[3] = { 0xdeadbeefu, 0x12345678u, 0xcafef00du };
+    checkEq(ring.writePM4(pm4, 3) ? 1 : 0, 1, "wrote a draw-sized stream");
+    checkEq(ring.getWritePointer(), 3, "write pointer advanced");
+
+    // A wedged submission leaves both pointers in the middle of the ring; the
+    // reset has to put the next stream back at dword 0.
+    ring.reset();
+    checkEq(ring.getWritePointer(), 0, "write pointer rewound");
+    checkEq(ring.getReadPointer(), 0, "read pointer rewound");
+    const uint32_t* dwords = reinterpret_cast<const uint32_t*>(vram);
+    checkEq(dwords[0] | dwords[1] | dwords[2], 0, "stale packets cleared");
+    checkEq(ring.writePM4(pm4, 3) ? 1 : 0, 1, "ring accepts a stream after reset");
+    checkEq(ring.getWritePointer(), 3, "write pointer restarts from zero");
+}
+
 int main() {
     printf("test_graphics_ring\n");
     testDoorbellLandsAtDwordIndex();
+    testResetRewindsRing();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

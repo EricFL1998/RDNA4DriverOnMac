@@ -111,6 +111,7 @@ private:
     uint32_t vramLiveBlockCount { 0 };
     VramBlock vramFreeBlocks[kMaxVramBlocks];
     uint32_t vramFreeBlockCount { 0 };
+    IOLock* vramLock { nullptr };
     bool vramFreeInsert(uint64_t gpuAddr, uint64_t size);
     uint64_t vramFreeTake(uint64_t size, bool userRegion);
     void vramBlocksReset();
@@ -208,6 +209,21 @@ private:
     IOBufferMemoryDescriptor* gfxRingMd { nullptr };
     IOBufferMemoryDescriptor* graphicsWptrMd { nullptr };
     uint64_t graphicsRingGpuAddr { 0 };
+    // The NGG attribute/position/primitive rings are pipeline state the driver
+    // owns, not an application resource: they are allocated in VRAM here so a
+    // client never has to carve them out of its 32 MiB window.
+    uint64_t nggRingGpuAddr { 0 };
+    uint32_t nggRingSize { 0 };
+    // Graphics work is submitted through an INDIRECT_BUFFER: draws and the
+    // graphics register blocks are executed by the PFP, while the ME only
+    // consumes compute-style packets. An inline draw in the ring is accepted
+    // and skipped (rptr advances, fence completes, nothing renders). Two slots
+    // alternate so a buffer is never overwritten while the CP may still be
+    // reading it.
+    uint64_t graphicsIbGpuAddr { 0 };
+    uint32_t graphicsIbSlotBytes { 0 };
+    uint32_t graphicsIbSlot { 0 };
+    uint64_t graphicsMqdGpuAddr { 0 };
     uint64_t graphicsWptrGpuAddr { 0 };
     uint64_t graphicsRptrGpuAddr { 0 };
     // gfx_ring0 of the kernel doorbell map, as a DWORD index (0x8B << 1):
@@ -324,6 +340,9 @@ public:
     // 一次 PM4 提交，与其他提交者串行化。
     // Returns false when the ring could not accept the stream.
     bool submitComputeCommands(const uint32_t* pm4Data, size_t dwordCount);
+    // Reserve the returned fence under the same lock as its ring submission.
+    bool submitUserComputeCommands(const uint32_t* pm4Data, size_t dwordCount,
+                                   uint64_t* fenceOut);
     bool submitComputeCommandsLocked(const uint32_t* pm4Data, size_t dwordCount);
 
     // 只在用户可见窗口内分配。用户态
@@ -350,12 +369,21 @@ public:
     // MES 把 GFX pipe0/queue0 映射到我们的 ring 上（map_legacy_kq），
     // 之后所有绘制命令都走这条队列。
     bool initGraphicsRing();
+    bool resetGraphicsQueue();
     void snapshotGraphicsQueue(const char* stage);
+    void logGraphicsStateReadback();
+    // Counts the non-zero dwords the SPI wrote into the NGG attribute ring: the
+    // driver-readable proof that a vertex wave ran.
+    void scanNggRing();
+    void armNggRingSentinel();
     bool submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCount,
                                 uint64_t* fenceOut);
     bool waitForGraphicsFence(uint64_t fenceValue, uint64_t timeoutMS);
     uint64_t graphicsFenceGpuAddr();
     bool graphicsQueueReady() const { return graphicsQueueMapped; }
+    // Driver-owned NGG rings, published to clients through GetNggRing.
+    uint64_t nggRingBase() const { return nggRingGpuAddr; }
+    uint32_t nggRingBytes() const { return nggRingSize; }
 
     virtual IOReturn newUserClient(task_t owningTask, void* securityID,
                                    UInt32 type, IOUserClient** handler) override;

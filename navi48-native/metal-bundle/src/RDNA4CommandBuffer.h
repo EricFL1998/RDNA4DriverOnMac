@@ -5,4 +5,8 @@
 // header exists so a translation unit can import just the type it implements.
 #import "RDNA4Device.h"
 
+@interface RDNA4CommandBuffer (Rendering)
+- (void)recordEncodingError:(NSError*)error;
+@end
+
 #endif /* RDNA4CommandBuffer_h */

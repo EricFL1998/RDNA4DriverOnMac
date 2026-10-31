@@ -10,6 +10,13 @@ tools/pico-login/build*/
 navi48/
 navi48-native/*
 !navi48-native/metal-bundle/
+!navi48-native/airnt-plugin/
+# ...but only the plugin's sources: its object files, dylib and test binary
+# are build output (the dylib is an 85 MB LLVM link).
+navi48-native/airnt-plugin/*.o
+navi48-native/airnt-plugin/*.dylib
+navi48-native/airnt-plugin/bin/
+navi48-native/airnt-plugin/src/*.o
 tools/dyld-inspect/
 tools/pico-login/
 dist/metal/

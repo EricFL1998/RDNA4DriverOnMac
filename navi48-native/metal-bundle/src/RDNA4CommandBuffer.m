@@ -2,6 +2,7 @@
 #import "RDNA4UserClient.h"
 #import "RDNA4CommandQueue.h"
 #import "RDNA4ComputeCommandEncoder.h"
+#import "graphics/RDNA4RenderCommandEncoder.h"
 #import "RDNA4Device.h"
 #import <IOKit/IOKitLib.h>
 
@@ -13,6 +14,7 @@
     BOOL _usesGraphicsQueue;
     uint64_t _fenceValue;
     dispatch_semaphore_t _completionSemaphore;
+    NSError* _encodingError;
 }
 
 - (instancetype)initWithQueue:(RDNA4CommandQueue*)queue {
@@ -47,8 +49,10 @@
 }
 
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)renderPassDescriptor {
-    NSLog(@"RDNA4CommandBuffer: Render encoding not yet supported");
-    return nil;
+    RDNA4RenderCommandEncoder* encoder = [[RDNA4RenderCommandEncoder alloc]
+        initWithCommandBuffer:self renderPassDescriptor:renderPassDescriptor];
+    if (encoder) [_encoders addObject:encoder];
+    return encoder;
 }
 
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
@@ -72,6 +76,10 @@
 }
 
 - (void)commit {
+    if (_status == MTLCommandBufferStatusError) {
+        [self notifyCompletion];
+        return;
+    }
     if (_status == MTLCommandBufferStatusNotEnqueued) {
         [self enqueue];
     }
@@ -179,8 +187,13 @@
     NSLog(@"RDNA4CommandBuffer: presentDrawable not yet supported");
 }
 
+- (void)recordEncodingError:(NSError*)error {
+    if (!_encodingError) _encodingError = error;
+    _status = MTLCommandBufferStatusError;
+}
+
 - (NSError*)error {
-    return nil;  // TODO: Track errors
+    return _encodingError;
 }
 
 - (CFTimeInterval)kernelStartTime {

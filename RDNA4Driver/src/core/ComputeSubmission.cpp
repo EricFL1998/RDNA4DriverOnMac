@@ -1,6 +1,19 @@
 #include "RDNA4Driver.hpp"
 #include <IOKit/IOLib.h>
 #include "../hardware/VramLayout.hpp"
+#include "../hardware/PM4BuilderKernel.hpp"
+
+namespace {
+// All clients share the live/free tables, including asynchronous close paths.
+class VramLockGuard {
+    IOLock* lock;
+public:
+    explicit VramLockGuard(IOLock* value) : lock(value) {
+        if (lock) IOLockLock(lock);
+    }
+    ~VramLockGuard() { if (lock) IOLockUnlock(lock); }
+};
+} // namespace
 
 //==============================================================================
 // compute ring 与命令提交
@@ -222,12 +235,17 @@ bool RDNA4Driver::initComputeRing() {
 }
 
 uint64_t RDNA4Driver::allocateVRAMBuffer(size_t size) {
+    VramLockGuard guard(vramLock);
     if (!computeRing || computeHeapNext == 0) {
         LOG_ERROR("allocateVRAMBuffer: compute ring not initialized");
         return 0;
     }
     if (!vram || vramSize == 0 || size == 0) {
         LOG_ERROR("allocateVRAMBuffer: VRAM not available or zero size");
+        return 0;
+    }
+    if (vramLiveBlockCount >= kMaxVramBlocks) {
+        LOG_ERROR("allocateVRAMBuffer: live-block table full (%u)", kMaxVramBlocks);
         return 0;
     }
 
@@ -255,13 +273,9 @@ uint64_t RDNA4Driver::allocateVRAMBuffer(size_t size) {
     computeHeapNext += allocSize;
     const uint64_t gpuAddress = gmcContext.vramStart + vramOffset;
 
-    if (vramLiveBlockCount < kMaxVramBlocks) {
-        vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
-        vramLiveBlocks[vramLiveBlockCount].size = allocSize;
-        vramLiveBlockCount++;
-    } else {
-        LOG_ERROR("allocateVRAMBuffer: live-block table full (%u)", kMaxVramBlocks);
-    }
+    vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
+    vramLiveBlocks[vramLiveBlockCount].size = allocSize;
+    vramLiveBlockCount++;
 
     LOG("allocateVRAMBuffer: allocated %llu bytes at GPU 0x%llx (VRAM+0x%llx)",
         static_cast<unsigned long long>(allocSize),
@@ -282,9 +296,16 @@ uint64_t RDNA4Driver::userHeapSize() const {
 }
 
 uint64_t RDNA4Driver::allocateUserVRAMBuffer(size_t size) {
+    VramLockGuard guard(vramLock);
     const uint64_t window = userHeapSize();
     if (!vram || window == 0 || size == 0) {
         LOG_ERROR("allocateUserVRAMBuffer: no user window (size=%zu)", size);
+        return 0;
+    }
+    // Returning an untracked address would make both FreeBuffer and connection
+    // teardown leak it permanently. Fail before consuming a free range or bump.
+    if (vramLiveBlockCount >= kMaxVramBlocks) {
+        LOG_ERROR("allocateUserVRAMBuffer: live-block table full (%u)", kMaxVramBlocks);
         return 0;
     }
     constexpr uint64_t alignment = 0x1000;
@@ -316,14 +337,9 @@ uint64_t RDNA4Driver::allocateUserVRAMBuffer(size_t size) {
     const uint64_t gpuAddress = gmcContext.vramStart + userHeapNext;
     userHeapNext += allocSize;
 
-    if (vramLiveBlockCount < kMaxVramBlocks) {
-        vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
-        vramLiveBlocks[vramLiveBlockCount].size = allocSize;
-        vramLiveBlockCount++;
-    } else {
-        LOG_ERROR("allocateUserVRAMBuffer: live-block table full, 0x%llx cannot be freed",
-                  static_cast<unsigned long long>(gpuAddress));
-    }
+    vramLiveBlocks[vramLiveBlockCount].gpuAddr = gpuAddress;
+    vramLiveBlocks[vramLiveBlockCount].size = allocSize;
+    vramLiveBlockCount++;
 
     LOG("allocateUserVRAMBuffer: %llu bytes at GPU 0x%llx (VRAM+0x%llx)",
         static_cast<unsigned long long>(allocSize),
@@ -365,6 +381,7 @@ void RDNA4Driver::refreshRingReadPtr() {
 }
 
 void RDNA4Driver::freeVRAMBuffer(uint64_t gpuAddress) {
+    VramLockGuard guard(vramLock);
     if (!computeRing || !vram || gpuAddress < gmcContext.vramStart) {
         LOG_ERROR("freeVRAMBuffer: 0x%llx is not a heap address",
                   static_cast<unsigned long long>(gpuAddress));
@@ -481,6 +498,35 @@ bool RDNA4Driver::submitComputeCommands(const uint32_t* pm4Data, size_t dwordCou
     const bool ok = submitComputeCommandsLocked(pm4Data, dwordCount);
     if (submitLock) IOLockUnlock(submitLock);
     return ok;
+}
+
+bool RDNA4Driver::submitUserComputeCommands(const uint32_t* pm4Data, size_t dwordCount,
+                                            uint64_t* fenceOut) {
+    if (!computeRing || !submitLock || !pm4Data || !fenceOut ||
+        dwordCount == 0 || dwordCount > 256u * 1024u) return false;
+    const uint64_t fenceAddress = computeFenceGpuAddr();
+    if (!fenceAddress) return false;
+
+    // Fence numbers must follow queue order. Reserving outside this lock lets
+    // N+1 complete before N is even submitted, making wait(N) unsafe for freeing.
+    IOLockLock(submitLock);
+    const uint64_t fence = allocFenceValue();
+    PM4BuilderKernel fencePacket;
+    fencePacket.emitFenceWrite(fenceAddress, fence);
+    const size_t fenceDwords = fencePacket.getPacketCount();
+    const size_t totalDwords = dwordCount + fenceDwords;
+    uint32_t* stream = static_cast<uint32_t*>(IOMalloc(totalDwords * sizeof(uint32_t)));
+    if (!stream) {
+        IOLockUnlock(submitLock);
+        return false;
+    }
+    for (size_t i = 0; i < dwordCount; ++i) stream[i] = pm4Data[i];
+    for (size_t i = 0; i < fenceDwords; ++i) stream[dwordCount + i] = fencePacket.getPackets()[i];
+    const bool submitted = submitComputeCommandsLocked(stream, totalDwords);
+    IOFree(stream, totalDwords * sizeof(uint32_t));
+    IOLockUnlock(submitLock);
+    if (submitted) *fenceOut = fence;
+    return submitted;
 }
 
 bool RDNA4Driver::submitComputeCommandsLocked(const uint32_t* pm4Data,

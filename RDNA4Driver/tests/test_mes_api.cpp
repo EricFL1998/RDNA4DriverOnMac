@@ -184,6 +184,32 @@ static void testCompletionStatus() {
     checkEq(MesApi::completionStatusDword(0xff), 0, "unknown opcode has no status layout");
 }
 
+static void testResetLayout() {
+    printf("\n[MESAPI__RESET legacy GFX queue]\n");
+    uint32_t pkt[MesApi::kFrameDwords];
+    MesApi::ResetQueueInput in {};
+    in.doorbellOffset = 0x116;
+    in.mqdAddr = 0x1122334450ull;
+    in.wptrAddr = 0x99AABBCCull;
+    in.pipe = 0;
+    in.queue = 0;
+    in.vmid = 0;
+    MesApi::buildResetQueueLegacy(pkt, in);
+    checkEq(pkt[0], 1u | (8u << 4) | (64u << 12), "RESET header");
+    checkEq(pkt[1], 1u << 3, "reset_legacy_gfx flag");
+    checkEq(pkt[8], MesApi::kQueueTypeGfx, "queue_type @ dw8");
+    checkEq(pkt[9], 0u, "pipe_id_lp @ dw9");
+    checkEq(pkt[10], 0u, "queue_id_lp @ dw10");
+    checkEq(pkt[11], 0u, "vmid_id_lp @ dw11");
+    checkEq(pkt[12], 0x22334450u, "mqd_mc_addr_lp @ dw12");
+    checkEq(pkt[13], 0x11u, "mqd_mc_addr_lp high @ dw13");
+    checkEq(pkt[14], 0x116u, "doorbell_offset_lp @ dw14");
+    checkEq(pkt[16], 0x99AABBCCu, "wptr_addr_lp @ dw16");
+    checkEq(pkt[17], 0u, "wptr_addr_lp high @ dw17");
+    checkEq(MesApi::completionStatusDword(MesApi::kOpReset), 28u,
+            "RESET api_status @ dw28");
+}
+
 int main() {
     printf("test_mes_api\n");
     testAddQueueLayout();
@@ -192,6 +218,7 @@ int main() {
     testDoorbellWindows();
     testDoorbellIndexUnits();
     testCompletionStatus();
+    testResetLayout();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

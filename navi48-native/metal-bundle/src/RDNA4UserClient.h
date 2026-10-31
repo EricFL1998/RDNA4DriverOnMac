@@ -35,7 +35,10 @@ void RDNA4GpuLinkRelease(void);
 void* RDNA4GpuPointerForAddress(RDNA4GpuLink* link, uint64_t gpuAddress);
 
 uint64_t RDNA4GpuAllocate(RDNA4GpuLink* link, uint64_t size);
-void RDNA4GpuFree(RDNA4GpuLink* link, uint64_t gpuAddress);
+// The driver-owned NGG rings (attribute/position/primitive). They are pipeline
+// state, so they never come out of the client's own window. Returns 0 when the
+// graphics queue is not up.
+uint64_t RDNA4GpuNggRing(RDNA4GpuLink* link, uint32_t* size);void RDNA4GpuFree(RDNA4GpuLink* link, uint64_t gpuAddress);
 
 // Submits dwords; *fence receives the value the driver's fence packet carries.
 // The driver appends that packet itself, so callers must not emit one.

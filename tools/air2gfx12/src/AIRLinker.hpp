@@ -1,5 +1,6 @@
 #pragma once
 
+#include "GFX12Emitter.hpp"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <cstdint>
@@ -17,7 +18,13 @@ public:
     bool loadRuntime(const std::string& runtimeBcPath);
 
     // Parse user AIR bitcode into a module, lower address spaces, and link required air.* functions
-    std::unique_ptr<llvm::Module> loadAndLink(const uint8_t* bitcodeData, size_t size, const std::string& entryName = "", std::string* outError = nullptr);
+    std::unique_ptr<llvm::Module> loadAndLink(const uint8_t* bitcodeData, size_t size,
+                                              const std::string& entryName = "",
+                                              std::string* outError = nullptr);
+    std::unique_ptr<llvm::Module> loadAndLink(const uint8_t* bitcodeData, size_t size,
+                                              const std::string& entryName,
+                                              ShaderStage stage,
+                                              std::string* outError);
 
 private:
     llvm::LLVMContext& mContext;

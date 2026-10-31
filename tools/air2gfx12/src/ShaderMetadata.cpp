@@ -36,6 +36,15 @@ uint32_t KernelStats::computePgmRsrc1() const {
     return val;
 }
 
+uint32_t KernelStats::graphicsPgmRsrc1() const {
+    // SPI_SHADER_PGM_RSRC1: VGPRS is in units of 4 VGPRs (SGPRS in units of 8).
+    // Encoding the VGPR count in units of 8 under-allocates the wave - 9 VGPRs
+    // became 8 - and SPI then refuses to launch it.
+    uint32_t vgprBlocks = vgprCount > 0 ? (vgprCount - 1) / 4 : 0;
+    uint32_t sgprBlocks = sgprCount > 0 ? (sgprCount - 1) / 8 : 0;
+    return (vgprBlocks & 0x3fu) | ((sgprBlocks & 0xfu) << 6) | (0xf0u << 12) | (1u << 25);
+}
+
 uint32_t KernelStats::computePgmRsrc2() const {
     // GFX12 COMPUTE_PGM_RSRC2 layout:
     // [0]     SCRATCH_EN: 1 if scratchBytes > 0
@@ -104,6 +113,41 @@ bool ShaderMetadata::parseFromAssembly(const std::string& asmText, std::vector<K
     }
 
     return !outStats.empty();
+}
+
+bool ShaderMetadata::parseGraphicsFromAssembly(const std::string& asmText,
+                                                const std::string& entryName,
+                                                KernelStats& outStats) {
+    outStats = KernelStats();
+    outStats.name = entryName;
+    const std::string declaration = "\t.type\t" + entryName + ",@function";
+    const std::string prefix = "\t.set .L" + entryName + ".";
+    std::istringstream stream(asmText);
+    std::string line;
+    bool inFunction = false;
+    bool hasStats = false;
+    while (std::getline(stream, line)) {
+        if (line == declaration) {
+            inFunction = true;
+            continue;
+        }
+        if (!inFunction) continue;
+        const std::pair<const char*, uint32_t*> fields[] = {
+            {"num_vgpr", &outStats.vgprCount},
+            {"numbered_sgpr", &outStats.sgprCount},
+            {"private_seg_size", &outStats.scratchBytes},
+        };
+        for (const auto& field : fields) {
+            const std::string marker = prefix + field.first;
+            if (line.compare(0, marker.size(), marker) != 0) continue;
+            size_t comma = line.find(',', marker.size());
+            if (comma != std::string::npos) {
+                *field.second = parseTrailingUInt(line.substr(comma + 1));
+                hasStats = true;
+            }
+        }
+    }
+    return hasStats;
 }
 
 bool ShaderMetadata::parseFromAssemblyFile(const std::string& asmPath, std::vector<KernelStats>& outStats) {

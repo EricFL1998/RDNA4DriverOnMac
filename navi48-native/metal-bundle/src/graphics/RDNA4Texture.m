@@ -1,5 +1,6 @@
 #import "RDNA4Texture.h"
 #import "RDNA4Device.h"
+#import "RDNA4UserClient.h"
 #import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurface.h>
 
@@ -18,6 +19,7 @@
     
     uint64_t _gpuAddress;
     size_t _allocationSize;
+    void* _mappedMemory;
     IOSurfaceRef _iosurface;
     
     BOOL _isRenderTarget;
@@ -101,25 +103,14 @@
 }
 
 - (size_t)calculateAllocationSize {
-    size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
     size_t totalSize = 0;
-    
     for (NSUInteger level = 0; level < _mipmapLevelCount; level++) {
-        NSUInteger levelWidth = MAX(1, _width >> level);
-        NSUInteger levelHeight = MAX(1, _height >> level);
-        NSUInteger levelDepth = MAX(1, _depth >> level);
-        
-        size_t levelSize = levelWidth * levelHeight * levelDepth * bytesPerPixel;
-        totalSize += levelSize;
+        const NSUInteger levelHeight = MAX(1, _height >> level);
+        const NSUInteger levelDepth = MAX(1, _depth >> level);
+        totalSize += [self bytesPerRowForLevel:level] * levelHeight * levelDepth;
     }
-    
-    // Multiply by array length
     totalSize *= _arrayLength;
-    
-    // Add alignment padding
-    totalSize = (totalSize + 255) & ~255;
-    
-    return totalSize;
+    return (totalSize + 255) & ~255;
 }
 
 - (size_t)bytesPerPixelForFormat:(MTLPixelFormat)format {
@@ -186,61 +177,25 @@
 }
 
 - (BOOL)allocateGPUMemory {
-    // Get IOUserClient connection
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("RDNA4Accel"));
-    if (!service) {
-        NSLog(@"RDNA4Texture: RDNA4Accel service not found");
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (!link) return NO;
+    _gpuAddress = RDNA4GpuAllocate(link, _allocationSize);
+    if (!_gpuAddress) return NO;
+    _mappedMemory = RDNA4GpuPointerForAddress(link, _gpuAddress);
+    if (!_mappedMemory) {
+        RDNA4GpuFree(link, _gpuAddress);
+        _gpuAddress = 0;
         return NO;
     }
-    
-    io_connect_t connection;
-    kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &connection);
-    IOObjectRelease(service);
-    
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"RDNA4Texture: Failed to open IOUserClient");
-        return NO;
-    }
-    
-    // Allocate texture memory (256-byte aligned for tiling)
-    uint64_t input = _allocationSize;
-    uint64_t output;
-    uint32_t outputCount = 1;
-    
-    kr = IOConnectCallMethod(connection, 1,  // method_AllocateBuffer
-                            &input, 1,
-                            NULL, 0,
-                            &output, &outputCount,
-                            NULL, NULL);
-    
-    IOServiceClose(connection);
-    
-    if (kr != KERN_SUCCESS || output == 0) {
-        NSLog(@"RDNA4Texture: Failed to allocate GPU memory");
-        return NO;
-    }
-    
-    _gpuAddress = output;
     return YES;
 }
 
 - (void)freeGPUMemory {
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("RDNA4Accel"));
-    if (service) {
-        io_connect_t connection;
-        if (IOServiceOpen(service, mach_task_self(), 0, &connection) == KERN_SUCCESS) {
-            uint64_t input = _gpuAddress;
-            IOConnectCallMethod(connection, 2,  // method_FreeBuffer
-                               &input, 1,
-                               NULL, 0,
-                               NULL, NULL,
-                               NULL, NULL);
-            IOServiceClose(connection);
-        }
-        IOObjectRelease(service);
-    }
+    if (!_gpuAddress) return;
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (link) RDNA4GpuFree(link, _gpuAddress);
+    _mappedMemory = NULL;
+    _gpuAddress = 0;
 }
 
 - (uint64_t)gpuAddress {
@@ -251,9 +206,7 @@
     NSUInteger levelWidth = MAX(1, _width >> level);
     size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
     
-    // Align to 256 bytes
-    NSUInteger bytesPerRow = levelWidth * bytesPerPixel;
-    return (bytesPerRow + 255) & ~255;
+    return levelWidth * bytesPerPixel;
 }
 
 - (NSUInteger)bytesPerImageForLevel:(NSUInteger)level {
@@ -273,46 +226,30 @@
         return;
     }
     
-    // Calculate destination offset in GPU memory
-    uint64_t destOffset = [self offsetForLevel:level slice:slice];
-    uint64_t destAddress = _gpuAddress + destOffset;
-    
-    // For now, use simple upload
-    // TODO: Implement tiled texture upload
-    
-    size_t regionWidth = region.size.width;
-    size_t regionHeight = region.size.height;
-    size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
-    
-    // Get IOUserClient connection
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("RDNA4Accel"));
-    if (!service) return;
-    
-    io_connect_t connection;
-    if (IOServiceOpen(service, mach_task_self(), 0, &connection) != KERN_SUCCESS) {
-        IOObjectRelease(service);
-        return;
+    const NSUInteger width = MAX(1, _width >> level);
+    const NSUInteger height = MAX(1, _height >> level);
+    if (!_mappedMemory || level >= _mipmapLevelCount || slice >= _arrayLength ||
+        region.origin.x > width || region.origin.y > height ||
+        region.size.width > width - region.origin.x ||
+        region.size.height > height - region.origin.y) return;
+    const size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
+    if (bytesPerRow < region.size.width * bytesPerPixel ||
+        (slice != 0 && bytesPerImage == 0)) return;
+
+    const uint64_t offset = [self offsetForLevel:level slice:slice];
+    const size_t rowBytes = [self bytesPerRowForLevel:level];
+    const uint64_t lastByte = offset +
+        (region.origin.y + region.size.height - (region.size.height ? 1 : 0)) * rowBytes +
+        (region.origin.x + region.size.width) * bytesPerPixel;
+    if (lastByte > _allocationSize) return;
+
+    const uint8_t* source = (const uint8_t*)pixelBytes + slice * bytesPerImage;
+    uint8_t* destination = (uint8_t*)_mappedMemory + offset;
+    for (size_t y = 0; y < region.size.height; ++y) {
+        memcpy(destination + (region.origin.y + y) * rowBytes + region.origin.x * bytesPerPixel,
+               source + y * bytesPerRow,
+               region.size.width * bytesPerPixel);
     }
-    
-    // Upload row by row
-    for (size_t y = 0; y < regionHeight; y++) {
-        const uint8_t* srcRow = (const uint8_t*)pixelBytes + y * bytesPerRow;
-        uint64_t destRow = destAddress + (region.origin.y + y) * [self bytesPerRowForLevel:level]
-                          + region.origin.x * bytesPerPixel;
-        
-        size_t rowSize = regionWidth * bytesPerPixel;
-        
-        uint64_t inputs[1] = {destRow};
-        IOConnectCallMethod(connection, 5,  // method_UploadData
-                           inputs, 1,
-                           srcRow, rowSize,
-                           NULL, NULL,
-                           NULL, NULL);
-    }
-    
-    IOServiceClose(connection);
-    IOObjectRelease(service);
 }
 
 - (void)getBytes:(void*)pixelBytes
@@ -327,43 +264,30 @@
         return;
     }
     
-    // Calculate source offset in GPU memory
-    uint64_t srcOffset = [self offsetForLevel:level slice:slice];
-    uint64_t srcAddress = _gpuAddress + srcOffset;
-    
-    size_t regionWidth = region.size.width;
-    size_t regionHeight = region.size.height;
-    size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
-    
-    // Get IOUserClient connection
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("RDNA4Accel"));
-    if (!service) return;
-    
-    io_connect_t connection;
-    if (IOServiceOpen(service, mach_task_self(), 0, &connection) != KERN_SUCCESS) {
-        IOObjectRelease(service);
-        return;
+    const NSUInteger width = MAX(1, _width >> level);
+    const NSUInteger height = MAX(1, _height >> level);
+    if (!_mappedMemory || level >= _mipmapLevelCount || slice >= _arrayLength ||
+        region.origin.x > width || region.origin.y > height ||
+        region.size.width > width - region.origin.x ||
+        region.size.height > height - region.origin.y) return;
+    const size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
+    if (bytesPerRow < region.size.width * bytesPerPixel ||
+        (slice != 0 && bytesPerImage == 0)) return;
+
+    const uint64_t offset = [self offsetForLevel:level slice:slice];
+    const size_t rowBytes = [self bytesPerRowForLevel:level];
+    const uint64_t lastByte = offset +
+        (region.origin.y + region.size.height - (region.size.height ? 1 : 0)) * rowBytes +
+        (region.origin.x + region.size.width) * bytesPerPixel;
+    if (lastByte > _allocationSize) return;
+
+    const uint8_t* source = (const uint8_t*)_mappedMemory + offset;
+    uint8_t* destination = (uint8_t*)pixelBytes + slice * bytesPerImage;
+    for (size_t y = 0; y < region.size.height; ++y) {
+        memcpy(destination + y * bytesPerRow,
+               source + (region.origin.y + y) * rowBytes + region.origin.x * bytesPerPixel,
+               region.size.width * bytesPerPixel);
     }
-    
-    // Download row by row
-    for (size_t y = 0; y < regionHeight; y++) {
-        uint8_t* destRow = (uint8_t*)pixelBytes + y * bytesPerRow;
-        uint64_t srcRow = srcAddress + (region.origin.y + y) * [self bytesPerRowForLevel:level]
-                         + region.origin.x * bytesPerPixel;
-        
-        size_t rowSize = regionWidth * bytesPerPixel;
-        
-        uint64_t inputs[1] = {srcRow};
-        IOConnectCallMethod(connection, 6,  // method_DownloadData
-                           inputs, 1,
-                           NULL, 0,
-                           NULL, NULL,
-                           destRow, &rowSize);
-    }
-    
-    IOServiceClose(connection);
-    IOObjectRelease(service);
 }
 
 - (uint64_t)offsetForLevel:(NSUInteger)level slice:(NSUInteger)slice {

@@ -72,6 +72,15 @@ void GraphicsRing::setReadPointer(uint32_t rptr) {
     readPtr = rptr;
 }
 
+void GraphicsRing::reset() {
+    writePtr = 0;
+    readPtr = 0;
+    if (ring) {
+        for (size_t i = 0; i < ringSizeDwords; i++) ring[i] = 0;
+    }
+    if (fence) *fence = 0;
+}
+
 void GraphicsRing::submit() {
     if (!doorbell) return;
     // gfx_v12_0_ring_set_wptr_gfx(): WDOORBELL64(ring->doorbell_index, wptr).

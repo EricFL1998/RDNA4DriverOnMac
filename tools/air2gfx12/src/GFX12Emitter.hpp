@@ -7,9 +7,15 @@
 
 namespace air2gfx12 {
 
+enum class ShaderStage {
+    Vertex,
+    Fragment,
+    Kernel,
+};
+
 class GFX12Emitter {
 public:
-    GFX12Emitter();
+    explicit GFX12Emitter(ShaderStage stage = ShaderStage::Kernel);
     ~GFX12Emitter();
 
     // Configure the module for GFX12 (triple, datalayout)

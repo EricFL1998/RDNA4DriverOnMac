@@ -9,8 +9,9 @@
 
 namespace air2gfx12 {
 
-GFX12Emitter::GFX12Emitter()
-    : mTriple("amdgcn-amd-amdhsa"), mCPU("gfx1201") {
+GFX12Emitter::GFX12Emitter(ShaderStage stage)
+    : mTriple(stage == ShaderStage::Kernel ? "amdgcn-amd-amdhsa" : "amdgcn--mesa3d"),
+      mCPU("gfx1201") {
     // Initialize LLVM AMDGPU target
     LLVMInitializeAMDGPUTargetInfo();
     LLVMInitializeAMDGPUTarget();

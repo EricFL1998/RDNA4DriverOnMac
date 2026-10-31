@@ -36,6 +36,27 @@
  */
 - (uint64_t)fragmentShaderGPUAddress;
 
+@property (readonly) uint64_t attributeRingGPUAddress;
+@property (readonly) uint32_t attributeRingSize;
+
+/**
+ * Copy of the attribute ring's leading bytes, for post-draw diagnostics: the
+ * vertex stage writes its exports here, so an untouched ring means no waves ran.
+ */
+- (NSData*)attributeRingContentsOfLength:(NSUInteger)length;
+
+/**
+ * Copy of any NGG ring region relative to the ring base, for diagnostics that
+ * need the position (0x580000) or primitive (0x980000) ring rather than the
+ * attribute ring at offset 0.
+ */
+- (NSData*)ringContentsAtOffset:(NSUInteger)offset length:(NSUInteger)length;
+
+/**
+ * Zero the attribute ring so a post-draw scan for non-zero data is meaningful.
+ */
+- (void)clearAttributeRing;
+
 /**
  * Get vertex shader metadata
  */

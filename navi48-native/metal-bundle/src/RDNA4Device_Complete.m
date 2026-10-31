@@ -1,24 +1,76 @@
 #import "RDNA4Device.h"
 #import "RDNA4CommandQueue.h"
 #import "RDNA4Buffer.h"
-#import "RDNA4Texture.h"
+#import "graphics/RDNA4Texture.h"
 #import "RDNA4Library.h"
 #import "RDNA4Function.h"
 #import "RDNA4ComputePipelineState.h"
+#import "graphics/RDNA4RenderPipelineState.h"
+#import <objc/runtime.h>
 
 @implementation RDNA4Device {
     NSString* _name;
     uint64_t _registryID;
+    uint64_t _vramSize;
+    io_service_t _rdna4AcceleratorPort;
+    id _rdna4AcceleratorService;
+}
+
++ (void)load {
+    // The private protocol is supplied by the running Metal.framework, not
+    // the SDK. The framework base does not itself declare this conformance;
+    // MTLAddDevice checks it separately from the _MTLDevice subclass check.
+    Protocol *spi = objc_getProtocol("MTLDeviceSPI");
+    if (spi) class_addProtocol(self, spi);
 }
 
 - (instancetype)init {
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOServiceMatching("RDNA4Accel"));
+    self = [self initWithAcceleratorPort:service];
+    if (service) IOObjectRelease(service);
+    return self;
+}
+
+- (instancetype)initWithAcceleratorPort:(io_service_t)service {
+    // Initialize the framework base before any failing path: its dealloc
+    // releases dispatch queues created by -init, even when we return nil.
     self = [super init];
     if (self) {
+        Protocol *spi = objc_getProtocol("MTLDeviceSPI");
+        if (!spi || !class_conformsToProtocol([self class], spi) ||
+            !service || !IOObjectConformsTo(service, "RDNA4Accel") ||
+            IORegistryEntryGetRegistryEntryID(service, &_registryID) != KERN_SUCCESS ||
+            IOObjectRetain(service) != KERN_SUCCESS) {
+            return nil;
+        }
+        _rdna4AcceleratorPort = service;
         _name = @"AMD Radeon RX 9070 XT (RDNA4)";
-        _registryID = 0x7550;  // Device ID
+        NSNumber *vram = CFBridgingRelease(IORegistryEntryCreateCFProperty(
+            service, CFSTR("vram-size"), kCFAllocatorDefault, 0));
+        _vramSize = [vram isKindOfClass:[NSNumber class]] ? vram.unsignedLongLongValue : 0;
     }
     return self;
 }
+
+- (void)dealloc {
+    if (_rdna4AcceleratorPort) IOObjectRelease(_rdna4AcceleratorPort);
+}
+
+// MTLIOAccelService owns hotplug notifications and holds a weak device.
+// Keep it alive just as MTLIOAccelDevice does; do not create a retain cycle.
+- (void)_setAcceleratorService:(id)service {
+    _rdna4AcceleratorService = service;
+}
+
+- (io_service_t)acceleratorPort { return _rdna4AcceleratorPort; }
+
+// _MTLDevice's native limit/feature-query initialization requires a desktop
+// feature profile. 10000 is the Mac profile used by AppleParavirtDevice.
+- (NSUInteger)featureProfile { return 10000; }
+- (NSString *)vendorName { return @"AMD"; }
+- (NSString *)familyName { return @"Radeon"; }
+- (NSString *)productName { return @"RX 9070 XT"; }
 
 #pragma mark - Device Properties
 
@@ -47,7 +99,7 @@
 }
 
 - (uint64_t)recommendedMaxWorkingSetSize {
-    return 16ULL * 1024 * 1024 * 1024;  // 16 GB VRAM
+    return _vramSize;
 }
 
 - (MTLDeviceLocation)location {
@@ -178,8 +230,7 @@
 #pragma mark - Texture Creation
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor {
-    NSLog(@"RDNA4Device: Texture creation not yet implemented");
-    return nil;
+    return [[RDNA4Texture alloc] initWithDevice:self descriptor:descriptor];
 }
 
 - (id<MTLTexture>)newSharedTextureWithDescriptor:(MTLTextureDescriptor*)descriptor {
@@ -207,27 +258,32 @@
     return [[RDNA4Library alloc] initWithDevice:self data:data error:error];
 }
 
-- (id<MTLLibrary>)newLibraryWithSource:(NSString*)source 
-                               options:(MTLCompileOptions*)options 
-                                 error:(NSError**)error {
-    NSLog(@"RDNA4Device: Runtime compilation not yet implemented");
-    if (error) {
-        *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                     code:-1
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Runtime compilation not supported"}];
-    }
-    return nil;
+- (id<MTLLibrary>)rdna4LibraryFromCompiledLibrary:(id<MTLLibrary>)compiled
+                                             error:(NSError**)error {
+    if (!compiled) return nil;
+    NSData* data = [(id)compiled valueForKey:@"libraryDataContents"];
+    if (!data) return compiled;
+    dispatch_data_t dispatchData = dispatch_data_create(data.bytes, data.length,
+                                                        dispatch_get_main_queue(),
+                                                        DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    return [self newLibraryWithData:dispatchData error:error];
 }
 
-- (void)newLibraryWithSource:(NSString*)source 
-                     options:(MTLCompileOptions*)options 
+- (id<MTLLibrary>)newLibraryWithSource:(NSString*)source
+                               options:(MTLCompileOptions*)options
+                                 error:(NSError**)error {
+    id<MTLLibrary> compiled = [super newLibraryWithSource:source options:options error:error];
+    return [self rdna4LibraryFromCompiledLibrary:compiled error:error];
+}
+
+- (void)newLibraryWithSource:(NSString*)source
+                     options:(MTLCompileOptions*)options
            completionHandler:(MTLNewLibraryCompletionHandler)completionHandler {
-    NSError* error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                         code:-1
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Runtime compilation not supported"}];
-    if (completionHandler) {
-        completionHandler(nil, error);
-    }
+    [super newLibraryWithSource:source options:options completionHandler:
+        ^(id<MTLLibrary> compiled, NSError* error) {
+            id<MTLLibrary> library = [self rdna4LibraryFromCompiledLibrary:compiled error:&error];
+            if (completionHandler) completionHandler(library, error);
+        }];
 }
 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL*)url error:(NSError**)error {
@@ -278,13 +334,9 @@
 
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor*)descriptor 
                                                              error:(NSError**)error {
-    NSLog(@"RDNA4Device: Render pipeline not yet implemented");
-    if (error) {
-        *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                     code:-2
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Render pipeline not yet supported"}];
-    }
-    return nil;
+    return [[RDNA4RenderPipelineState alloc] initWithDevice:self
+                                                 descriptor:descriptor
+                                                      error:error];
 }
 
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor*)descriptor 

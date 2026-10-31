@@ -3,6 +3,7 @@
 
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOLib.h>
 
 class RDNA4Driver;
 
@@ -31,13 +32,14 @@ class RDNA4DriverUserClient : public IOUserClient {
 public:
     bool start(IOService* provider) override;
     void stop(IOService* provider) override;
+    void free() override;
     IOReturn clientClose() override;
     IOReturn clientDied() override;
 
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits* options,
                                  IOMemoryDescriptor** memory) override;
 
-    static const IOExternalMethodDispatch sMethods[8];
+    static const IOExternalMethodDispatch sMethods[9];
 
 protected:
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments* arguments,
@@ -46,6 +48,16 @@ protected:
 
 private:
     RDNA4Driver* driver { nullptr };
+    // A connection owns its allocations even when user-space destructors never
+    // run (process exit/crash). Serialise dispatch against close and stop.
+    IOLock* clientLock { nullptr };
+    bool closing { false };
+    static constexpr uint32_t kMaxAllocations = 64;
+    uint64_t allocations[kMaxAllocations] {};
+    uint32_t allocationCount { 0 };
+    uint64_t lastComputeFence { 0 };
+    uint64_t lastGraphicsFence { 0 };
+    void releaseAllocations(); // clientLock must be held
 
     static IOReturn sGetDeviceInfo(OSObject* target, void* reference,
                                    IOExternalMethodArguments* arguments);
@@ -63,6 +75,8 @@ private:
                                        IOExternalMethodArguments* arguments);
     static IOReturn sGetGraphicsInfo(OSObject* target, void* reference,
                                      IOExternalMethodArguments* arguments);
+    static IOReturn sGetNggRing(OSObject* target, void* reference,
+                                IOExternalMethodArguments* arguments);
 };
 
 #endif /* RDNA4DriverUserClient_hpp */

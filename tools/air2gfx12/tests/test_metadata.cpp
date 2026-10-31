@@ -35,6 +35,29 @@ int main() {
                   << ", RSRC2=0x" << rsrc2 << std::dec << "\n";
     }
 
+    const std::string graphicsAssembly =
+        "\t.globl\tfragmentShader\n"
+        "\t.type\tfragmentShader,@function\n"
+        "fragmentShader:\n"
+        ".LfragmentShader$local:\n"
+        "\t.type\t.LfragmentShader$local,@function\n"
+        "\texp\tmrt0, v0, v1, v2, v3 off\n"
+        "\ts_endpgm\n"
+        "\t.set .LfragmentShader.num_vgpr, 7\n"
+        "\t.set .LfragmentShader.numbered_sgpr, 34\n"
+        "\t.set .LfragmentShader.private_seg_size, 16\n";
+    air2gfx12::KernelStats graphics;
+    assert(air2gfx12::ShaderMetadata::parseGraphicsFromAssembly(
+        graphicsAssembly, "fragmentShader", graphics));
+    assert(graphics.name == "fragmentShader");
+    assert(graphics.vgprCount == 7);
+    assert(graphics.sgprCount == 34);
+    assert(graphics.scratchBytes == 16);
+    assert(graphics.graphicsPgmRsrc1() == 0x020f0101u);
+    assert(!air2gfx12::ShaderMetadata::parseGraphicsFromAssembly(
+        graphicsAssembly, "missingShader", graphics));
+    std::cout << "  Passed: Graphics function metadata comes from the requested symbol\n";
+
     // 3. Test metadata parsing from ELF object
     std::vector<air2gfx12::KernelStats> elfStats;
     bool okElf = air2gfx12::ShaderMetadata::parseFromELFFile("/tmp/out_kernel.o", elfStats);

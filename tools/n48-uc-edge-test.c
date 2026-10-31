@@ -155,7 +155,8 @@ static void testBoundaries(io_connect_t conn, volatile uint8_t* mapped,
 
     kr = release(conn, second);
     kr = release(conn, second);
-    report("double free is survivable", kr == KERN_SUCCESS, "driver still alive below");
+    report("double free is survivable", kr == KERN_SUCCESS || kr == kIOReturnBadArgument,
+           "driver still alive below");
 
     uint64_t third = 0;
     kr = allocate(conn, 4096, &third);

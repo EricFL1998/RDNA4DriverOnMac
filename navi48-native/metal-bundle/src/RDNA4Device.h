@@ -1,13 +1,18 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOKit/IOKitLib.h>
+#import "RDNA4MetalDeviceSPI.h"
 
 /**
  * RDNA4Device - Native Metal Device Implementation for AMD RDNA4 GPUs
  * 
- * This is a stub implementation that conforms to MTLDevice protocol.
- * 设备对象骨架；实际的 GPU 通信经 user client 完成
+ * Metal discovers this _MTLDevice subclass through RDNA4Accel's registry
+ * properties. GPU communication uses the separate RDNA4Driver user client.
  */
-@interface RDNA4Device : NSObject <MTLDevice>
+@interface RDNA4Device : _MTLDevice <MTLDevice>
+
+// Called by Metal's MTLIOAccelService, with the matched accelerator service.
+- (instancetype)initWithAcceleratorPort:(io_service_t)service;
 
 // Device identification
 @property (readonly) NSString* name;

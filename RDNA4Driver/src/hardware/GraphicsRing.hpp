@@ -26,6 +26,10 @@ public:
     bool writePM4(const uint32_t* pm4, size_t dwordCount);
     void setReadPointer(uint32_t rptr);
     void submit();
+    // After a queue reset the CP restarts at ring dword 0, so the software
+    // pointers and the fence page have to follow it. Without this the next
+    // submission lands where the old, wedged CP left off and never completes.
+    void reset();
 
     uint32_t getWritePointer() const { return writePtr; }
     uint32_t getReadPointer() const { return readPtr; }

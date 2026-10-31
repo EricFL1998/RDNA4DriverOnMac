@@ -1,4 +1,5 @@
 #include "AIRLinker.hpp"
+#include "AIRGraphicsLowering.hpp"
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -29,7 +30,16 @@ bool AIRLinker::loadRuntime(const std::string& runtimeBcPath) {
     return true;
 }
 
-std::unique_ptr<llvm::Module> AIRLinker::loadAndLink(const uint8_t* bitcodeData, size_t size, const std::string& entryName, std::string* outError) {
+std::unique_ptr<llvm::Module> AIRLinker::loadAndLink(const uint8_t* bitcodeData, size_t size,
+                                                     const std::string& entryName,
+                                                     std::string* outError) {
+    return loadAndLink(bitcodeData, size, entryName, ShaderStage::Kernel, outError);
+}
+
+std::unique_ptr<llvm::Module> AIRLinker::loadAndLink(const uint8_t* bitcodeData, size_t size,
+                                                     const std::string& entryName,
+                                                     ShaderStage stage,
+                                                     std::string* outError) {
     if (!bitcodeData || size == 0) {
         if (outError) *outError = "Empty bitcode buffer";
         return nullptr;
@@ -59,39 +69,34 @@ std::unique_ptr<llvm::Module> AIRLinker::loadAndLink(const uint8_t* bitcodeData,
         }
     }
 
-    // Lower Metal-specific conventions to AMDGPU:
-    // 1. Metal addrspace(2) is Constant memory -> in AMDGPU, Constant memory is addrspace(4)
-    // 2. Kernel entry calling convention: set to amdgpu_kernel
+    if (!entryName.empty()) {
+        llvm::Function* entry = userModule->getFunction(entryName);
+        if (!entry || entry->isDeclaration()) {
+            if (outError) *outError = "Entry function not found: " + entryName;
+            return nullptr;
+        }
+        entry = lowerGraphicsFunction(*entry, stage, outError);
+        if (!entry) return nullptr;
+        entry->setLinkage(llvm::GlobalValue::ExternalLinkage);
+        llvm::CallingConv::ID convention = llvm::CallingConv::AMDGPU_KERNEL;
+        if (stage == ShaderStage::Vertex) convention = llvm::CallingConv::AMDGPU_GS;
+        if (stage == ShaderStage::Fragment) convention = llvm::CallingConv::AMDGPU_PS;
+        entry->setCallingConv(convention);
+    } else {
+        for (auto& fn : userModule->functions()) {
+            if (!fn.isDeclaration() && !fn.hasInternalLinkage() && fn.getReturnType()->isVoidTy()) {
+                fn.setCallingConv(llvm::CallingConv::AMDGPU_KERNEL);
+            }
+        }
+    }
+
     std::string irStr;
     llvm::raw_string_ostream os(irStr);
     userModule->print(os, nullptr);
-
-    // Replace addrspace(2) with addrspace(4)
     size_t pos = 0;
     while ((pos = irStr.find("addrspace(2)", pos)) != std::string::npos) {
         irStr.replace(pos, 12, "addrspace(4)");
         pos += 12;
-    }
-
-    // Replace entry function definition calling convention if entryName is specified
-    if (!entryName.empty()) {
-        std::string pattern = "define void @" + entryName;
-        size_t kpos = irStr.find(pattern);
-        if (kpos != std::string::npos) {
-            irStr.replace(kpos, pattern.length(), "define amdgpu_kernel void @" + entryName);
-        }
-    } else {
-        // If entryName not given, look for any non-internal function with void return
-        // and add amdgpu_kernel if not already present
-        for (auto& fn : userModule->functions()) {
-            if (!fn.isDeclaration() && !fn.hasInternalLinkage() && fn.getReturnType()->isVoidTy()) {
-                std::string fnPattern = "define void @" + fn.getName().str();
-                size_t fnPos = irStr.find(fnPattern);
-                if (fnPos != std::string::npos) {
-                    irStr.replace(fnPos, fnPattern.length(), "define amdgpu_kernel void @" + fn.getName().str());
-                }
-            }
-        }
     }
 
     llvm::SMDiagnostic smErr;

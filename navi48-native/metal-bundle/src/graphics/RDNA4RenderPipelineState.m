@@ -4,14 +4,20 @@
 #import "RDNA4Library.h"
 #import "RDNA4RenderPipelineDescriptor.h"
 #import "RDNA4VertexDescriptor.h"
-#import <IOKit/IOKitLib.h>
+#import "RDNA4Buffer.h"
+#import "RDNA4UserClient.h"
 
 @implementation RDNA4RenderPipelineState {
     RDNA4Device* _device;
     RDNA4CompiledShader* _vertexShader;
     RDNA4CompiledShader* _fragmentShader;
+    RDNA4Buffer* _vertexShaderBuffer;
+    RDNA4Buffer* _fragmentShaderBuffer;
+    RDNA4Buffer* _attributeRingBuffer;
     uint64_t _vertexShaderGPUAddress;
     uint64_t _fragmentShaderGPUAddress;
+    uint64_t _attributeRingGPUAddress;
+    uint32_t _attributeRingSize;
     
     MTLVertexDescriptor* _vertexDescriptor;
     MTLPixelFormat _colorAttachmentFormats[8];
@@ -63,6 +69,40 @@
         if (![self uploadShadersToVRAM:error]) {
             return nil;
         }
+        if (_vertexShader.vertexParameterCount > 0) {
+            // The NGG rings must live in memory the client's VMID maps: the
+            // vertex stage writes its parameter exports into them with ordinary
+            // global stores, and a driver-owned VRAM buffer is not mapped there
+            // (the stores are dropped silently while the GE's own ring writes
+            // still land). So the rings are carved out of the client window -
+            // 0x580000 of attribute ring (0x160000 per SE), then the position and
+            // primitive rings - and N48_RING_IN_DRIVER_VRAM opts back out.
+            RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+            uint32_t ringSize = 0;
+            uint64_t ringBase = 0;
+            if (!getenv("N48_RING_IN_DRIVER_VRAM") && link) {
+                uint64_t raw = RDNA4GpuAllocate(link, 0xA80000u + 0x10000u);
+                if (raw) {
+                    ringBase = (raw + 0xFFFFu) & ~0xFFFFull;   // the GE needs a 64 KiB-aligned base
+                    void* ring = RDNA4GpuPointerForAddress(link, ringBase);
+                    if (ring) memset(ring, 0, 0xA80000u);
+                    ringSize = 0xA80000u;
+                }
+            }
+            if (!ringBase) {
+                ringBase = link ? RDNA4GpuNggRing(link, &ringSize) : 0;
+            }
+            if (!ringBase) {
+                if (error) {
+                    *error = [NSError errorWithDomain:@"com.rdna4.metal"
+                                                 code:-5
+                                             userInfo:@{NSLocalizedDescriptionKey: @"The driver's NGG ring is not available"}];
+                }
+                return nil;
+            }
+            _attributeRingGPUAddress = ringBase;
+            _attributeRingSize = 0x160000;   // GFX12::kAttributeRingPerSE
+        }
         
         // Store vertex descriptor
         _vertexDescriptor = [descriptor.vertexDescriptor copy];
@@ -94,140 +134,33 @@
 }
 
 - (BOOL)uploadShadersToVRAM:(NSError**)error {
-    // Get IOUserClient connection
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("RDNA4Accel"));
-    if (!service) {
+    _vertexShaderBuffer = (RDNA4Buffer*)[_device newBufferWithBytes:_vertexShader.machineCode
+                                                              length:_vertexShader.machineCodeSize
+                                                             options:MTLResourceStorageModeShared];
+    if (!_vertexShaderBuffer) {
         if (error) {
             *error = [NSError errorWithDomain:@"com.rdna4.metal"
                                          code:-3
-                                     userInfo:@{NSLocalizedDescriptionKey: @"RDNA4Accel service not found"}];
-        }
-        return NO;
-    }
-    
-    io_connect_t connection;
-    kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &connection);
-    IOObjectRelease(service);
-    
-    if (kr != KERN_SUCCESS) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                         code:kr
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Failed to open IOUserClient"}];
-        }
-        return NO;
-    }
-    
-    // Allocate VRAM for vertex shader
-    size_t vsSize = (_vertexShader.machineCodeSize + 16383) & ~16383;  // 16KB aligned
-    uint64_t outputs[2];
-    uint32_t outputCount = 1;
-    uint64_t input = vsSize;
-    
-    kr = IOConnectCallMethod(connection, 1,  // method_AllocateBuffer
-                            &input, 1,
-                            NULL, 0,
-                            outputs, &outputCount,
-                            NULL, NULL);
-    
-    if (kr != KERN_SUCCESS || outputs[0] == 0) {
-        IOServiceClose(connection);
-        if (error) {
-            *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                         code:kr
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Failed to allocate vertex shader VRAM"}];
-        }
-        return NO;
-    }
-    
-    _vertexShaderGPUAddress = outputs[0];
-    
-    // Upload vertex shader code
-    uint64_t uploadInputs[1] = {_vertexShaderGPUAddress};
-    kr = IOConnectCallMethod(connection, 5,  // method_UploadData
-                            uploadInputs, 1,
-                            _vertexShader.machineCode, _vertexShader.machineCodeSize,
-                            NULL, NULL,
-                            NULL, NULL);
-    
-    if (kr != KERN_SUCCESS) {
-        IOServiceClose(connection);
-        if (error) {
-            *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                         code:kr
                                      userInfo:@{NSLocalizedDescriptionKey: @"Failed to upload vertex shader"}];
         }
         return NO;
     }
-    
-    // Allocate and upload fragment shader if present
+    _vertexShaderGPUAddress = _vertexShaderBuffer.gpuAddress;
     if (_fragmentShader && _fragmentShader.machineCode) {
-        size_t fsSize = (_fragmentShader.machineCodeSize + 16383) & ~16383;
-        input = fsSize;
-        
-        kr = IOConnectCallMethod(connection, 1,  // method_AllocateBuffer
-                                &input, 1,
-                                NULL, 0,
-                                outputs, &outputCount,
-                                NULL, NULL);
-        
-        if (kr != KERN_SUCCESS || outputs[0] == 0) {
-            IOServiceClose(connection);
+        _fragmentShaderBuffer = (RDNA4Buffer*)[_device newBufferWithBytes:_fragmentShader.machineCode
+                                                                    length:_fragmentShader.machineCodeSize
+                                                                   options:MTLResourceStorageModeShared];
+        if (!_fragmentShaderBuffer) {
             if (error) {
                 *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                             code:kr
-                                         userInfo:@{NSLocalizedDescriptionKey: @"Failed to allocate fragment shader VRAM"}];
-            }
-            return NO;
-        }
-        
-        _fragmentShaderGPUAddress = outputs[0];
-        
-        // Upload fragment shader code
-        uploadInputs[0] = _fragmentShaderGPUAddress;
-        kr = IOConnectCallMethod(connection, 5,  // method_UploadData
-                                uploadInputs, 1,
-                                _fragmentShader.machineCode, _fragmentShader.machineCodeSize,
-                                NULL, NULL,
-                                NULL, NULL);
-        
-        if (kr != KERN_SUCCESS) {
-            IOServiceClose(connection);
-            if (error) {
-                *error = [NSError errorWithDomain:@"com.rdna4.metal"
-                                             code:kr
+                                             code:-4
                                          userInfo:@{NSLocalizedDescriptionKey: @"Failed to upload fragment shader"}];
             }
             return NO;
         }
+        _fragmentShaderGPUAddress = _fragmentShaderBuffer.gpuAddress;
     }
-    
-    IOServiceClose(connection);
     return YES;
-}
-
-- (void)dealloc {
-    // Free shader memory
-    if (_vertexShaderGPUAddress != 0) {
-        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                           IOServiceMatching("RDNA4Accel"));
-        if (service) {
-            io_connect_t connection;
-            if (IOServiceOpen(service, mach_task_self(), 0, &connection) == KERN_SUCCESS) {
-                uint64_t input = _vertexShaderGPUAddress;
-                IOConnectCallMethod(connection, 2, &input, 1, NULL, 0, NULL, NULL, NULL, NULL);
-                
-                if (_fragmentShaderGPUAddress != 0) {
-                    input = _fragmentShaderGPUAddress;
-                    IOConnectCallMethod(connection, 2, &input, 1, NULL, 0, NULL, NULL, NULL, NULL);
-                }
-                
-                IOServiceClose(connection);
-            }
-            IOObjectRelease(service);
-        }
-    }
 }
 
 - (id<MTLDevice>)device {
@@ -317,6 +250,39 @@
 
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithAdditionalBinaryFunctions:(NSArray<id<MTLFunction>>*)functions error:(NSError**)error {
     return nil;  // Not yet supported
+}
+
+- (NSData*)attributeRingContentsOfLength:(NSUInteger)length {
+    if (!_attributeRingGPUAddress) return nil;
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (!link) return nil;
+    void* ptr = RDNA4GpuPointerForAddress(link, _attributeRingGPUAddress);
+    if (!ptr) return nil;
+    uint32_t ringSize = _attributeRingSize ? _attributeRingSize : 0x160000;
+    if (length > ringSize) length = ringSize;
+    return [NSData dataWithBytes:ptr length:length];
+}
+
+- (NSData*)ringContentsAtOffset:(NSUInteger)offset length:(NSUInteger)length {
+    if (!_attributeRingGPUAddress) return nil;
+    const NSUInteger total = 0xA80000u;
+    if (offset >= total) return nil;
+    if (length > total - offset) length = total - offset;
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (!link) return nil;
+    void* ptr = RDNA4GpuPointerForAddress(link, _attributeRingGPUAddress + offset);
+    if (!ptr) return nil;
+    return [NSData dataWithBytes:ptr length:length];
+}
+
+- (void)clearAttributeRing {
+    if (!_attributeRingGPUAddress) return;
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (!link) return;
+    void* ptr = RDNA4GpuPointerForAddress(link, _attributeRingGPUAddress);
+    if (!ptr) return;
+    uint32_t ringSize = _attributeRingSize ? _attributeRingSize : 0x160000;
+    memset(ptr, 0, ringSize);
 }
 
 @end

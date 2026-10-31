@@ -57,6 +57,7 @@
 @interface RDNA4CompiledShader : NSObject
 
 @property (nonatomic, strong) NSString* functionName;
+@property (nonatomic, assign) MTLFunctionType functionType;
 @property (nonatomic, assign) const void* machineCode;  // GFX12 binary
 @property (nonatomic, assign) size_t machineCodeSize;
 @property (nonatomic, assign) uint32_t sgprCount;
@@ -73,5 +74,6 @@
 // encoder refuses to program a stage that has none rather than guessing.
 @property (nonatomic, assign) uint32_t pgmRsrc1;
 @property (nonatomic, assign) uint32_t pgmRsrc2;
+@property (nonatomic, assign) uint32_t vertexParameterCount;
 
 @end

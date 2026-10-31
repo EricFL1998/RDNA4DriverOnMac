@@ -11,7 +11,7 @@ LDFLAGS  := $(LLVM_LDFLAGS) $(LLVM_LIBS)
 BIN_DIR := bin
 OBJ_DIR := obj
 
-SRCS := src/main.cpp src/MTLBUnpacker.cpp src/AIRLinker.cpp src/GFX12Emitter.cpp src/ShaderMetadata.cpp src/PM4Builder.cpp
+SRCS := src/main.cpp src/MTLBUnpacker.cpp src/AIRLinker.cpp src/AIRGraphicsLowering.cpp src/GFX12Emitter.cpp src/ShaderMetadata.cpp src/PM4Builder.cpp
 OBJS := $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
 TARGET := $(BIN_DIR)/air2gfx12
 
@@ -20,8 +20,9 @@ TEST_LINKER   := $(BIN_DIR)/test_linker
 TEST_EMITTER  := $(BIN_DIR)/test_emitter
 TEST_METADATA := $(BIN_DIR)/test_metadata
 TEST_PM4      := $(BIN_DIR)/test_pm4
+TEST_GRAPHICS := $(BIN_DIR)/test_graphics_lowering
 
-TEST_BINARIES := $(TEST_UNPACKER) $(TEST_LINKER) $(TEST_EMITTER) $(TEST_METADATA) $(TEST_PM4)
+TEST_BINARIES := $(TEST_UNPACKER) $(TEST_LINKER) $(TEST_EMITTER) $(TEST_METADATA) $(TEST_PM4) $(TEST_GRAPHICS)
 
 .PHONY: all clean test build_tests test_unpacker test_linker test_emitter test_metadata test_pm4 test_golden verify_phase1
 
@@ -47,8 +48,8 @@ $(TEST_UNPACKER): $(OBJ_DIR)/MTLBUnpacker.o tests/test_unpacker.cpp | $(BIN_DIR)
 test_linker: $(TEST_LINKER)
 	./$(TEST_LINKER)
 
-$(TEST_LINKER): $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/MTLBUnpacker.o tests/test_linker.cpp | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) tests/test_linker.cpp $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/MTLBUnpacker.o $(LDFLAGS) -o $@
+$(TEST_LINKER): $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/MTLBUnpacker.o tests/test_linker.cpp | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) tests/test_linker.cpp $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/MTLBUnpacker.o $(LDFLAGS) -o $@
 
 test_emitter: $(TEST_EMITTER)
 	./$(TEST_EMITTER)
@@ -71,12 +72,18 @@ $(TEST_PM4): $(OBJ_DIR)/PM4Builder.o tests/test_pm4.cpp | $(BIN_DIR)
 test_golden: all
 	bash tests/batch_golden_test.sh
 
+test_graphics: $(TEST_GRAPHICS)
+	./$(TEST_GRAPHICS)
+
+$(TEST_GRAPHICS): tests/test_graphics_lowering.cpp $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/GFX12Emitter.o | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
 verify_phase1: all build_tests
 	bash tests/phase1_full_verification.sh
 
 clean:
 	rm -rf $(BIN_DIR) $(OBJ_DIR)
 
-test: all test_unpacker test_linker test_emitter test_metadata test_pm4 test_golden
+test: all test_unpacker test_linker test_emitter test_metadata test_pm4 test_graphics test_golden
 	bash tests/test_cli.sh
 	bash tests/e2e_test.sh

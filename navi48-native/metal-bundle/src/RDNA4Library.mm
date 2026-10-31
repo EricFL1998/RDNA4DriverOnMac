@@ -3,24 +3,24 @@
 #import "RDNA4Function.h"
 #import <dlfcn.h>
 
-// AIRNT Plugin function pointers (from libAMDNTPlugin.dylib)
-typedef void* AIRNTContext;
-typedef void* AIRNTExecutable;
+#import "../../airnt-plugin/include/airnt_plugin.h"
+#include "../../../tools/air2gfx12/src/MTLBUnpacker.hpp"
 
-typedef int (*AIRNTInit_t)(AIRNTContext* ctx, uint32_t version);
+typedef AIRNTStatus (*AIRNTInit_t)(AIRNTContext* ctx, uint32_t version);
 typedef void (*AIRNTDestroy_t)(AIRNTContext ctx);
-typedef int (*AIRNTCompile_t)(AIRNTContext ctx, const void* bitcode, size_t size,
-                              const char* entryPoint, AIRNTExecutable* exec, char** error);
-typedef int (*AIRNTGetMachineCode_t)(AIRNTExecutable exec, const void** code, size_t* size);
-typedef int (*AIRNTGetMetadata_t)(AIRNTExecutable exec, uint32_t* sgpr, uint32_t* vgpr,
-                                  uint32_t* wave, uint32_t* scratch, uint32_t* lds,
-                                  uint32_t* rsrc1, uint32_t* rsrc2);
+typedef AIRNTStatus (*AIRNTCompile_t)(AIRNTContext ctx, const void* bitcode, size_t size,
+                                      const AIRNTCompileOptions* options,
+                                      AIRNTExecutable* exec, char** error);
+typedef AIRNTStatus (*AIRNTGetMachineCode_t)(AIRNTExecutable exec, const void** code, size_t* size);
+typedef AIRNTStatus (*AIRNTGetMetadata_t)(AIRNTExecutable exec, AIRNTShaderMetadata* metadata);
 typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
 
 @implementation RDNA4Library {
     RDNA4Device* _device;
     NSMutableDictionary<NSString*, RDNA4CompiledShader*>* _compiledShaders;
     NSData* _metallibData;
+    std::vector<air2gfx12::FunctionEntry> _functionEntries;
+    NSArray<NSString*>* _functionNames;
     
     // AIRNT plugin handle
     void* _airntHandle;
@@ -145,164 +145,138 @@ typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
 }
 
 - (BOOL)parseMetallib:(NSError**)error {
-    // Simple MTLB parser - extract function names from NAME tags
-    // Full implementation would parse the complete MTLB structure
-    
     const uint8_t* bytes = (const uint8_t*)_metallibData.bytes;
     size_t length = _metallibData.length;
-    
-    // Check MTLB magic (0x4D54 4C42 = "MTLB")
-    if (length < 4 || memcmp(bytes, "MTLB", 4) != 0) {
+    if (!air2gfx12::MTLBUnpacker::unpack(bytes, length, _functionEntries)) {
         if (error) {
             *error = [NSError errorWithDomain:@"com.rdna4.metal"
                                          code:-3
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Invalid metallib format"}];
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Invalid metallib or no function bitcode"}];
         }
         return NO;
     }
-    
-    // For now, we'll extract function names on-demand when newFunctionWithName is called
-    // A full implementation would parse all NAME tags here
-    
-    NSLog(@"RDNA4Library: Loaded metallib (%zu bytes)", length);
+
+    NSMutableArray<NSString*>* names = [NSMutableArray arrayWithCapacity:_functionEntries.size()];
+    for (const auto& entry : _functionEntries) {
+        [names addObject:[NSString stringWithUTF8String:entry.name.c_str()]];
+    }
+    _functionNames = [names copy];
+    NSLog(@"RDNA4Library: Loaded metallib (%zu bytes, %lu functions)",
+          length, (unsigned long)_functionEntries.size());
     return YES;
 }
 
+- (const air2gfx12::FunctionEntry*)functionEntryForName:(NSString*)functionName {
+    for (const auto& entry : _functionEntries) {
+        if (entry.name == functionName.UTF8String) return &entry;
+    }
+    return nullptr;
+}
+
 - (id<MTLFunction>)newFunctionWithName:(NSString*)functionName {
-    // Check if already compiled
     RDNA4CompiledShader* cached = _compiledShaders[functionName];
     if (cached) {
         return [[RDNA4Function alloc] initWithDevice:_device
                                         compiledShader:cached
                                                   name:functionName];
     }
-    
-    // Extract AIR bitcode for this function from metallib
-    NSData* airBitcode = [self extractAIRBitcodeForFunction:functionName];
-    if (!airBitcode) {
+
+    const air2gfx12::FunctionEntry* entry = [self functionEntryForName:functionName];
+    if (!entry) {
         NSLog(@"RDNA4Library: Function '%@' not found in metallib", functionName);
         return nil;
     }
-    
-    // Compile AIR to GFX12 using AIRNT plugin
-    AIRNTExecutable executable;
+
+    MTLFunctionType functionType;
+    AIRNTCompileOptions options = {0};
+    switch (entry->type) {
+        case air2gfx12::FunctionType::Vertex:
+            functionType = MTLFunctionTypeVertex;
+            options.functionType = AIRNT_FUNCTION_TYPE_VERTEX;
+            break;
+        case air2gfx12::FunctionType::Fragment:
+            functionType = MTLFunctionTypeFragment;
+            options.functionType = AIRNT_FUNCTION_TYPE_FRAGMENT;
+            break;
+        default:
+            functionType = MTLFunctionTypeKernel;
+            options.functionType = AIRNT_FUNCTION_TYPE_KERNEL;
+            break;
+    }
+
+    AIRNTExecutable executable = nullptr;
     char* errorMsg = NULL;
-    int result = _airntCompile(_airntContext,
-                               airBitcode.bytes,
-                               airBitcode.length,
-                               [functionName UTF8String],
-                               &executable,
-                               &errorMsg);
-    
-    if (result != 0) {
+    options.entryPointName = entry->name.c_str();
+    options.optimizationLevel = 2;
+    AIRNTStatus result = _airntCompile(_airntContext, entry->bitcode.data(), entry->bitcode.size(),
+                                       &options, &executable, &errorMsg);
+    if (result != AIRNT_SUCCESS) {
         NSLog(@"RDNA4Library: Compilation failed for '%@': %s", functionName,
               errorMsg ? errorMsg : "unknown error");
         if (errorMsg) free(errorMsg);
         return nil;
     }
-    
-    // Get machine code
-    const void* machineCode;
-    size_t machineCodeSize;
-    _airntGetMachineCode(executable, &machineCode, &machineCodeSize);
-    
-    // Get metadata
-    uint32_t sgpr, vgpr, wave, scratch, lds, rsrc1, rsrc2;
-    _airntGetMetadata(executable, &sgpr, &vgpr, &wave, &scratch, &lds, &rsrc1, &rsrc2);
-    
-    // Create compiled shader object
+
+    const void* machineCode = nullptr;
+    size_t machineCodeSize = 0;
+    if (_airntGetMachineCode(executable, &machineCode, &machineCodeSize) != AIRNT_SUCCESS ||
+        !machineCode || machineCodeSize == 0) {
+        NSLog(@"RDNA4Library: No GFX12 machine code for '%@'", functionName);
+        _airntFreeExecutable(executable);
+        return nil;
+    }
+
+    AIRNTShaderMetadata metadata = {0};
+    _airntGetMetadata(executable, &metadata);
     RDNA4CompiledShader* compiled = [[RDNA4CompiledShader alloc] init];
     compiled.functionName = functionName;
-    
-    // Copy machine code (need to keep it alive)
+    compiled.functionType = functionType;
     void* copiedCode = malloc(machineCodeSize);
     memcpy(copiedCode, machineCode, machineCodeSize);
+    // Bisect hook: move the EXP `done` flag from the primitive export to the
+    // position export, the layout radv/m2tri use for an NGG passthrough VS.
+    {
+        const char* patch = getenv("N48_PATCH_EXP_DONE");
+        if (patch && *patch && machineCodeSize >= 4) {
+            uint32_t* words = (uint32_t*)copiedCode;
+            for (size_t i = 0; i < machineCodeSize / 4; i++) {
+                if (words[i] == 0xF80000CFu) words[i] = 0xF80001CFu;  // pos0: add done
+            }
+        }
+        const char* clearPrim = getenv("N48_CLEAR_PRIM_DONE");
+        if (clearPrim && *clearPrim && machineCodeSize >= 4) {
+            uint32_t* words = (uint32_t*)copiedCode;
+            for (size_t i = 0; i < machineCodeSize / 4; i++) {
+                if (words[i] == 0xF8000941u) words[i] = 0xF8000841u;  // prim: clear done
+            }
+        }
+    }
     compiled.machineCode = copiedCode;
     compiled.machineCodeSize = machineCodeSize;
-    
-    compiled.sgprCount = sgpr;
-    compiled.vgprCount = vgpr;
-    compiled.wavefrontSize = wave;
-    compiled.scratchBytes = scratch;
-    compiled.ldsBytes = lds;
-    compiled.computePgmRsrc1 = rsrc1;
-    compiled.computePgmRsrc2 = rsrc2;
-    
-    // Cache it
+    compiled.sgprCount = metadata.sgprCount;
+    compiled.vgprCount = metadata.vgprCount;
+    compiled.wavefrontSize = metadata.wavefrontSize;
+    compiled.scratchBytes = metadata.scratchBytes;
+    compiled.ldsBytes = metadata.ldsBytes;
+    compiled.computePgmRsrc1 = metadata.computePgmRsrc1;
+    compiled.computePgmRsrc2 = metadata.computePgmRsrc2;
+    compiled.pgmRsrc1 = metadata.pgmRsrc1;
+    compiled.pgmRsrc2 = metadata.pgmRsrc2;
+    compiled.vertexParameterCount = metadata.vertexParameterCount;
     _compiledShaders[functionName] = compiled;
-    
-    // Clean up AIRNT executable
     _airntFreeExecutable(executable);
-    
+
     NSLog(@"RDNA4Library: Compiled '%@' - %zu bytes, SGPR=%u, VGPR=%u",
-          functionName, machineCodeSize, sgpr, vgpr);
-    
+          functionName, machineCodeSize, metadata.sgprCount, metadata.vgprCount);
+    const char* dumpDir = getenv("N48_DUMP_SHADERS");
+    if (dumpDir && *dumpDir) {
+        NSString* path = [NSString stringWithFormat:@"%s/%@.bin", dumpDir, functionName];
+        [[NSData dataWithBytes:compiled.machineCode length:machineCodeSize] writeToFile:path atomically:YES];
+        NSLog(@"RDNA4Library: dumped '%@' to %@", functionName, path);
+    }
     return [[RDNA4Function alloc] initWithDevice:_device
                                     compiledShader:compiled
                                               name:functionName];
-}
-
-- (NSData*)extractAIRBitcodeForFunction:(NSString*)functionName {
-    // Parse MTLB container to extract AIR bitcode for specific function
-    // MTLB format:
-    //   Header: MTLB magic + version
-    //   Tags: NAME, TYPE, HASH, OFFS, SIZE, etc.
-    //   Data: AIR bitcode blobs
-    
-    const uint8_t* bytes = (const uint8_t*)_metallibData.bytes;
-    size_t length = _metallibData.length;
-    
-    // Skip header (16 bytes typically)
-    size_t offset = 16;
-    
-    // Scan for NAME tag matching functionName
-    while (offset + 8 < length) {
-        uint32_t tag = *(uint32_t*)(bytes + offset);
-        uint32_t size = *(uint32_t*)(bytes + offset + 4);
-        offset += 8;
-        
-        if (tag == 0x454D414E) {  // 'NAME' in little-endian
-            // Check if this name matches
-            if (offset + size <= length) {
-                NSString* name = [[NSString alloc] initWithBytes:(bytes + offset)
-                                                          length:size
-                                                        encoding:NSUTF8StringEncoding];
-                if ([name isEqualToString:functionName]) {
-                    // Found it! Now find corresponding DATA/BITC tag
-                    // For simplicity, assume next DATA tag is the bitcode
-                    // Real implementation would use OFFS/SIZE tags
-                    return [self findNextBitcodeFromOffset:offset + size];
-                }
-            }
-        }
-        
-        offset += size;
-    }
-    
-    return nil;
-}
-
-- (NSData*)findNextBitcodeFromOffset:(size_t)startOffset {
-    const uint8_t* bytes = (const uint8_t*)_metallibData.bytes;
-    size_t length = _metallibData.length;
-    size_t offset = startOffset;
-    
-    while (offset + 8 < length) {
-        uint32_t tag = *(uint32_t*)(bytes + offset);
-        uint32_t size = *(uint32_t*)(bytes + offset + 4);
-        offset += 8;
-        
-        // Look for DATA or BITC tag
-        if (tag == 0x41544144 || tag == 0x43544942) {  // 'DATA' or 'BITC'
-            if (offset + size <= length) {
-                return [NSData dataWithBytes:(bytes + offset) length:size];
-            }
-        }
-        
-        offset += size;
-    }
-    
-    return nil;
 }
 
 - (id<MTLFunction>)newFunctionWithName:(NSString*)functionName
@@ -318,8 +292,7 @@ typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
 }
 
 - (NSArray<NSString*>*)functionNames {
-    // Return cached function names
-    return [_compiledShaders allKeys];
+    return _functionNames;
 }
 
 @end

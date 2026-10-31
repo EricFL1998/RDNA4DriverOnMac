@@ -79,47 +79,60 @@
 }
 
 - (void)encodeRenderPassBegin {
-    // Configure render targets from render pass descriptor
+    // CONTEXT_CONTROL must come first: it makes the CP load and shadow the
+    // per-context state, which is what every SET_CONTEXT_REG below lands in.
+    [_pm4Builder enableContextState];
+    // gfx12 has no CLEAR_STATE packet, so nothing has initialised the context
+    // registers since power-on. The preamble writes the state the hardware
+    // would otherwise invent.
+    [_pm4Builder emitGraphicsPreamble];
+    // Context defaults MUST come after CONTEXT_CONTROL, otherwise CONTEXT_CONTROL's
+    // LOAD_ENABLE blows away these context registers!
+    [_pm4Builder setDepthDisabled];
+    [_pm4Builder setColorWriteMask:0xF shaderMask:0xF];
+    [_pm4Builder setBlendDisabled];
+    [_pm4Builder setCullMode:MTLCullModeNone winding:MTLWindingClockwise];
+    // Shader code was uploaded before this command buffer was recorded, so the
+    // instruction caches have to be invalidated before the draws run.
+    [_pm4Builder invalidateShaderCaches];
     for (NSUInteger i = 0; i < 8; i++) {
-        RDNA4RenderPassColorAttachmentDescriptor* attachment = 
+        RDNA4RenderPassColorAttachmentDescriptor* attachment =
             [_renderPassDescriptor.colorAttachments objectAtIndexedSubscript:i];
-        
-        if (attachment.texture) {
-            RDNA4Texture* texture = (RDNA4Texture*)attachment.texture;
-            
-            // Set color buffer
-            [_pm4Builder setColorBuffer:i texture:texture];
-            
-            // Handle load action
-            if (attachment.loadAction == MTLLoadActionClear) {
-                // TODO: Emit clear commands
-                NSLog(@"RDNA4RenderCommandEncoder: clear color %lu to (%.2f, %.2f, %.2f, %.2f)",
-                      i, attachment.clearColor.red, attachment.clearColor.green,
-                      attachment.clearColor.blue, attachment.clearColor.alpha);
+        if (!attachment.texture) continue;
+        RDNA4Texture* texture = (RDNA4Texture*)attachment.texture;
+        [_pm4Builder setColorBuffer:i texture:texture];
+        if (attachment.loadAction == MTLLoadActionClear) {
+            if (texture.pixelFormat != MTLPixelFormatBGRA8Unorm) {
+                [self failEncoding:@"Only BGRA8 clear is supported"];
+                continue;
             }
+            NSUInteger rowBytes = [texture bytesPerRowForLevel:0];
+            NSMutableData* pixels = [NSMutableData dataWithLength:rowBytes * texture.height];
+            const uint32_t r = (uint32_t)(attachment.clearColor.red * 255.0 + 0.5);
+            const uint32_t g = (uint32_t)(attachment.clearColor.green * 255.0 + 0.5);
+            const uint32_t b = (uint32_t)(attachment.clearColor.blue * 255.0 + 0.5);
+            const uint32_t a = (uint32_t)(attachment.clearColor.alpha * 255.0 + 0.5);
+            const uint32_t color = r | (g << 8) | (b << 16) | (a << 24);
+            uint32_t* target = (uint32_t*)pixels.mutableBytes;
+            for (NSUInteger pixel = 0; pixel < texture.width * texture.height; ++pixel) target[pixel] = color;
+            [texture replaceRegion:MTLRegionMake2D(0, 0, texture.width, texture.height)
+                       mipmapLevel:0 slice:0 withBytes:pixels.bytes
+                       bytesPerRow:rowBytes bytesPerImage:pixels.length];
         }
     }
-    
-    // TODO: Handle depth/stencil attachments
 }
 
 - (void)endEncoding {
-    if (!_isEncoding) {
-        NSLog(@"RDNA4RenderCommandEncoder: endEncoding called but not encoding");
+    if (!_isEncoding) return;
+    _isEncoding = NO;
+    // The kernel appends a RELEASE_MEM carrying CACHE_FLUSH_AND_INV_TS to every submission,
+    // so an explicit EVENT_WRITE here is unnecessary and wedges the CP.
+    NSData* commands = [_pm4Builder getPackets];
+    if (!commands.length) {
+        [self failEncoding:@"Render commands were rejected or are empty"];
         return;
     }
-    
-    // Flush caches
-    [_pm4Builder flushCaches];
-    
-    // Get encoded commands
-    NSData* commands = [_pm4Builder getPackets];
-    
-    // Add to command buffer
     [_commandBuffer appendRenderCommands:commands.bytes length:commands.length];
-    
-    _isEncoding = NO;
-    
     NSLog(@"RDNA4RenderCommandEncoder: encoding ended, %lu bytes", commands.length);
 }
 
@@ -136,9 +149,6 @@
     _currentPipelineState = (RDNA4RenderPipelineState*)pipelineState;
     _hasSetPipeline = YES;
     
-    // Program registers have to match the shader the compiler produced. Until
-    // the compiler emits SPI_SHADER_PGM_RSRC1/2_GS/PS, drawing would run with
-    // resource limits that do not describe the code, so draws are refused.
     uint64_t vsAddr = [_currentPipelineState vertexShaderGPUAddress];
     RDNA4CompiledShader* vs = [_currentPipelineState vertexShader];
     RDNA4CompiledShader* fs = [_currentPipelineState fragmentShader];
@@ -146,7 +156,10 @@
     const BOOL fsReady = fs == nil || (fs.pgmRsrc1 != 0);
 
     if (vsReady) {
-        [_pm4Builder setVertexShader:vsAddr rsrc1:vs.pgmRsrc1 rsrc2:vs.pgmRsrc2];
+        [_pm4Builder setVertexShader:vsAddr rsrc1:vs.pgmRsrc1 rsrc2:vs.pgmRsrc2
+                     parameterCount:vs.vertexParameterCount
+               attributeRingAddress:_currentPipelineState.attributeRingGPUAddress
+                 attributeRingSize:_currentPipelineState.attributeRingSize];
     }
     if (fs && fsReady) {
         [_pm4Builder setFragmentShader:[_currentPipelineState fragmentShaderGPUAddress]
@@ -161,29 +174,55 @@
     NSLog(@"RDNA4RenderCommandEncoder: set pipeline state");
 }
 
+- (void)failEncoding:(NSString*)message {
+    _pipelineReady = NO;
+    [_commandBuffer recordEncodingError:[NSError errorWithDomain:@"com.rdna4.metal"
+                                                            code:-10
+                                                        userInfo:@{NSLocalizedDescriptionKey: message}]];
+}
+
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
                  offset:(NSUInteger)offset
                 atIndex:(NSUInteger)index {
-    if (index >= 31) {
+    if (!buffer) return;
+    if (index != 0 || offset > buffer.length || !_currentPipelineState.vertexDescriptor) {
+        [self failEncoding:@"Only an explicit single packed vertex buffer is supported"];
         return;
     }
-    
+    MTLVertexDescriptor* descriptor = _currentPipelineState.vertexDescriptor;
+    NSUInteger expectedOffset = 0;
+    for (NSUInteger i = 0; i < 31; ++i) {
+        MTLVertexAttributeDescriptor* attribute = descriptor.attributes[i];
+        NSUInteger bytes = 0;
+        switch (attribute.format) {
+            case MTLVertexFormatInvalid: continue;
+            case MTLVertexFormatFloat: bytes = 4; break;
+            case MTLVertexFormatFloat2: bytes = 8; break;
+            case MTLVertexFormatFloat3: bytes = 12; break;
+            case MTLVertexFormatFloat4: bytes = 16; break;
+            default:
+                [self failEncoding:@"Only float vertex attributes are supported"];
+                return;
+        }
+        if (attribute.bufferIndex != index || attribute.offset != expectedOffset) {
+            [self failEncoding:@"Vertex attributes must be packed in shader order"];
+            return;
+        }
+        expectedOffset += bytes;
+    }
+    MTLVertexBufferLayoutDescriptor* layout = descriptor.layouts[index];
+    if (layout.stepFunction != MTLVertexStepFunctionPerVertex || layout.stepRate != 1 ||
+        layout.stride != expectedOffset) {
+        [self failEncoding:@"Vertex layout does not match the packed shader inputs"];
+        return;
+    }
+
     _vertexBuffers[index] = buffer;
     _vertexBufferOffsets[index] = offset;
-    
-    if (buffer) {
-        RDNA4Buffer* rdnaBuffer = (RDNA4Buffer*)buffer;
-        uint64_t gpuAddr = [rdnaBuffer gpuAddress] + offset;
-        
-        // Calculate stride and count from buffer size
-        // (In real implementation, would come from vertex descriptor)
-        uint32_t stride = 16;  // Assume 16 bytes per vertex
-        uint32_t count = (uint32_t)(buffer.length / stride);
-        
-        [_pm4Builder setVertexBuffer:index address:gpuAddr stride:stride count:count];
-        
-        NSLog(@"RDNA4RenderCommandEncoder: set vertex buffer %lu, GPU=0x%llx", index, gpuAddr);
-    }
+    RDNA4Buffer* rdnaBuffer = (RDNA4Buffer*)buffer;
+    uint64_t gpuAddr = rdnaBuffer.gpuAddress + offset;
+    uint32_t count = (uint32_t)((buffer.length - offset) / expectedOffset);
+    [_pm4Builder setVertexBuffer:index address:gpuAddr stride:(uint32_t)expectedOffset count:count];
 }
 
 - (void)setVertexBuffers:(const id<MTLBuffer>*)buffers
@@ -290,8 +329,9 @@
            vertexCount:(NSUInteger)vertexCount
          instanceCount:(NSUInteger)instanceCount {
     
-    if (!_hasSetPipeline) {
-        NSLog(@"RDNA4RenderCommandEncoder: drawPrimitives called without pipeline state");
+    if (!_hasSetPipeline || !_pipelineReady || !_vertexBuffers[0] ||
+        vertexCount == 0 || vertexStart != 0 || instanceCount != 1) {
+        [self failEncoding:@"Draw state is incomplete or unsupported"];
         return;
     }
     

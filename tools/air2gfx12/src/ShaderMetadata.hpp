@@ -19,6 +19,7 @@ struct KernelStats {
     uint32_t computePgmRsrc1() const;
     // Computes GFX12 COMPUTE_PGM_RSRC2 register value
     uint32_t computePgmRsrc2() const;
+    uint32_t graphicsPgmRsrc1() const;
 };
 
 class ShaderMetadata {
@@ -30,6 +31,8 @@ public:
     // Parse metadata from assembly text (.s)
     static bool parseFromAssembly(const std::string& asmText, std::vector<KernelStats>& outStats);
     static bool parseFromAssemblyFile(const std::string& asmPath, std::vector<KernelStats>& outStats);
+    static bool parseGraphicsFromAssembly(const std::string& asmText, const std::string& entryName,
+                                          KernelStats& outStats);
 };
 
 // Auto-locates the runtime.amdil.bc file

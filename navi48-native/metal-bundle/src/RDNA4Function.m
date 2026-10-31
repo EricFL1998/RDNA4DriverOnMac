@@ -18,9 +18,7 @@
         _compiledShader = compiledShader;
         _name = [name copy];
         
-        // Determine function type from name or metadata
-        // For now, assume all functions are compute kernels
-        _functionType = MTLFunctionTypeKernel;
+        _functionType = compiledShader.functionType;
     }
     return self;
 }

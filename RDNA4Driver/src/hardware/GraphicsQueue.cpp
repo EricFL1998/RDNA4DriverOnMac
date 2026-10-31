@@ -48,6 +48,13 @@ constexpr uint32_t kDefaultGfxMqdControl = 0x00000100u;  // PRIV_STATE = 1
 constexpr uint32_t kDefaultGfxHqdQuantum = 0x00000a01u;  // QUANTUM_EN
 
 constexpr uint32_t kGfxRingBytes = 64u * 1024u;   // 16384 dwords
+constexpr uint32_t kNggSentinel = 0xD35D0001u;
+// mmGB_ADDR_CONFIG: gc_12_0_0_offset.h dword offset (the gfx12 JSON keeps the
+// same dword numbering; 0x263E is the older gfx9 value).
+// gc_12_0_0 mm offsets. The gfx12 register JSON lists byte addresses (0x98F8
+// for GB_ADDR_CONFIG); these are the dword offsets the MMIO helper takes.
+constexpr uint32_t kRegGbAddrConfig = 0x13DEu;   // regGB_ADDR_CONFIG (gc_12_0_0_offset.h, BASE_IDX 0)
+constexpr uint32_t kRegCcRbBackendDisable = 0x13DDu;  // regCC_RB_BACKEND_DISABLE (gc_12_0_0_offset.h)
 constexpr uint32_t kCpRb0Rptr    = 0x0F60u;       // gc_12_0_0_offset.h
 constexpr uint32_t kCpMaxContext  = 0x1E4Eu;       // gc_12_0_0_offset.h:105
 constexpr uint32_t kCpDeviceId    = 0x1DEBu;       // gc_12_0_0_offset.h:94
@@ -120,6 +127,7 @@ bool RDNA4Driver::initGraphicsRing() {
                   static_cast<unsigned long long>(wptrGpu));
         return false;
     }
+    graphicsMqdGpuAddr = mqdGpu;
     graphicsWptrGpuAddr = wptrGpu;
     *static_cast<volatile uint32_t*>(graphicsWptrMd->getBytesNoCopy()) = 0;
 
@@ -195,7 +203,10 @@ bool RDNA4Driver::initGraphicsRing() {
 
     // gfx_v12_0_cp_gfx_start() runs right after the MES maps the queue: the CP
     // is already running on the async path, but it still needs its context
-    // count and device id before it will fetch from a mapped HQD.
+    // count and device id before it will fetch from a mapped HQD. GRBM routing
+    // must be set to me0/pipe0/queue0/vmid0 *before* writing these registers,
+    // or the writes land nowhere (the root cause of "PM4 writes don't stick").
+    grbmSelect(0, 0, 0, 0);
     writeGcRegister(kCpMaxContext, 8u - 1u, 0);
     writeGcRegister(kCpDeviceId, 1u, 0);
     gmcHDPFlush(*this);
@@ -204,9 +215,9 @@ bool RDNA4Driver::initGraphicsRing() {
     // The GFX HQD lives on me0/pipe0/queue0 (me1 is the PFP, which has no HQD
     // of its own - reading there returns zeros and looks like "not loaded").
     // The whole CP_GFX_HQD_* block is BASE_IDX 0 (gc_12_0_0_offset.h).
-    grbmSelect(0, 0, 0, 0);
     graphicsHqdActive = readGcRegister(MesApi::GfxHqd::kActive, MesApi::GfxHqd::kSegment);
     setProperty("GraphicsQueue,HqdActiveReg", static_cast<uint64_t>(graphicsHqdActive), 32);
+
     setProperty("GraphicsQueue,HqdMappedReg",
                 static_cast<uint64_t>(readGcRegister(MesApi::GfxHqd::kMapped, MesApi::GfxHqd::kSegment)), 32);
     setProperty("GraphicsQueue,HqdBaseReg",
@@ -264,6 +275,49 @@ bool RDNA4Driver::initGraphicsRing() {
     // CP_RB0_RPTR is the ring-0 read pointer: once the firmware has taken the
     // queue it tracks the ring instead of sitting at its reset value.
     setProperty("GraphicsQueue,Rptr", static_cast<uint64_t>(readGcRegister(kCpRb0Rptr, 0)), 32);
+    // The NGG rings belong to the pipeline, so they live in driver VRAM rather
+    // than the client window. Clients query the base through GetNggRing.
+    if (!nggRingGpuAddr) {
+        // The SPI/GE ring base registers carry bits [47:16], so the ring must
+        // start on a 64 KiB boundary; allocate the slack and round up.
+        const uint64_t raw = allocateVRAMBuffer(GFX12::kNggRingTotal + 0x10000u);
+        const uint64_t aligned = (raw + 0xFFFFu) & ~static_cast<uint64_t>(0xFFFFu);
+        if (raw && aligned >= gmcContext.vramStart) {
+            nggRingGpuAddr = aligned;
+            nggRingSize = GFX12::kNggRingTotal;
+            const uint64_t offset = aligned - gmcContext.vramStart;
+            if (offset < vramSize && nggRingSize <= vramSize - offset) {
+                memset(const_cast<uint8_t*>(vram) + offset, 0, nggRingSize);
+            }
+            gmcHDPFlush(*this);
+        } else {
+            LOG_ERROR("initGraphicsRing: NGG ring allocation failed");
+        }
+    }
+    setProperty("GraphicsQueue,NggRingGpu", nggRingGpuAddr, 64);
+    setProperty("GraphicsQueue,NggRingSize", static_cast<uint64_t>(nggRingSize), 32);
+
+    // Indirect-buffer storage for graphics work. Two 64 KiB slots, 256 B
+    // aligned (the packet keeps addr >> 2).
+    if (!graphicsIbGpuAddr) {
+        constexpr uint32_t kSlotBytes = 64u * 1024u;
+        constexpr uint32_t kSlots = 2u;
+        const uint64_t raw = allocateVRAMBuffer(kSlotBytes * kSlots + 0x1000u);
+        const uint64_t aligned = (raw + 0xFFu) & ~static_cast<uint64_t>(0xFFu);
+        if (raw && aligned >= gmcContext.vramStart) {
+            const uint64_t off = aligned - gmcContext.vramStart;
+            if (off < vramSize && kSlotBytes * kSlots <= vramSize - off) {
+                memset(const_cast<uint8_t*>(vram) + off, 0, kSlotBytes * kSlots);
+                graphicsIbGpuAddr = aligned;
+                graphicsIbSlotBytes = kSlotBytes;
+                graphicsIbSlot = 0;
+                gmcHDPFlush(*this);
+            }
+        }
+        if (!graphicsIbGpuAddr) LOG_ERROR("initGraphicsRing: IB allocation failed");
+    }
+    setProperty("GraphicsQueue,IbGpu", graphicsIbGpuAddr, 64);
+    setProperty("GraphicsQueue,IbSlotBytes", static_cast<uint64_t>(graphicsIbSlotBytes), 32);
     snapshotGraphicsQueue("AfterMap");
     return true;
 }
@@ -336,6 +390,67 @@ void RDNA4Driver::snapshotGraphicsQueue(const char* stage) {
     LOG("GFX diagnostic snapshot: %s", stage);
 }
 
+bool RDNA4Driver::resetGraphicsQueue() {
+    if (!graphicsMqdMd || !graphicsWptrMd || !graphicsMqdGpuAddr) return false;
+    MesApi::ResetQueueInput input {};
+    input.doorbellOffset = graphicsDoorbellIndex;
+    input.mqdAddr = graphicsMqdGpuAddr;
+    input.wptrAddr = graphicsWptrGpuAddr;
+    input.pipe = 0;
+    input.queue = 0;
+    input.vmid = 0;
+    uint32_t packet[MesApi::kFrameDwords];
+    MesApi::buildResetQueueLegacy(packet, input);
+    // mesSubmitAndWait refuses to run once it has latched a timeout, which
+    // would make the reset - the one call that can recover the queue - unable
+    // to submit at all. The reset is the recovery path, so it always gets to
+    // try; a failure re-latches the flag.
+    if (mesTimedOut) {
+        setProperty("GraphicsQueue,MesTimedOutBeforeReset", static_cast<uint64_t>(1), 32);
+        mesTimedOut = false;
+    }
+    bool ok = mesSubmitAndWait(0, packet, MesApi::kFrameDwords, mesStatusGpuAddr);
+    // reset_legacy_gfx has to touch the GFX pipe; when that pipe is the thing
+    // that wedged, the firmware consumes the frame and never acks. Fall back to
+    // the queue-only form, which leaves the pipe alone.
+    if (!ok) {
+        MesApi::buildResetQueueLegacy(packet, input, MesApi::kResetFlag_queueOnly);
+        ok = mesSubmitAndWait(0, packet, MesApi::kFrameDwords, mesStatusGpuAddr);
+        setProperty("GraphicsQueue,MesResetQueueOnly", static_cast<uint64_t>(ok ? 1 : 0), 32);
+    }
+    // The firmware does not ack either RESET form on a wedged GFX pipe, so the
+    // last resort is to take the queue away from MES and hand it back: a plain
+    // ADD_QUEUE is the one MES call this driver has seen succeed here.
+    if (!ok) {
+        MesApi::buildRemoveQueue(packet, input);
+        const bool removed = mesSubmitAndWait(0, packet, MesApi::kFrameDwords, mesStatusGpuAddr);
+        setProperty("GraphicsQueue,MesRemoveOk", static_cast<uint64_t>(removed ? 1 : 0), 32);
+        if (removed) {
+            ok = mesMapLegacyQueue(0, 0, graphicsDoorbellIndex, graphicsMqdGpuAddr,
+                                   graphicsWptrGpuAddr, mesStatusGpuAddr, MesApi::kQueueTypeGfx);
+            setProperty("GraphicsQueue,MesRecreateOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
+        }
+    }
+    setProperty("GraphicsQueue,MesResetOk", static_cast<uint64_t>(ok ? 1 : 0), 32);
+    // The reset puts the CP back at ring dword 0; the software ring and the MQD's
+    // cached read/write pointers have to agree with it, or the next submission is
+    // never consumed.
+    if (ok && graphicsRing) {
+        graphicsRing->reset();
+        if (graphicsMqdMd) {
+            uint32_t* mqd = static_cast<uint32_t*>(graphicsMqdMd->getBytesNoCopy());
+            mqd[kGfxHqdRptr] = 0;
+            mqd[kGfxHqdWptr] = 0;
+        }
+        if (graphicsWptrMd) {
+            *static_cast<volatile uint32_t*>(graphicsWptrMd->getBytesNoCopy()) = 0;
+        }
+        gmcHDPFlush(*this);
+    }
+    LOG("resetGraphicsQueue: MES reset_legacy_gfx %s", ok ? "acked" : "failed");
+    return ok;
+}
+
 bool RDNA4Driver::submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCount,
                                           uint64_t* fenceOut) {
     if (!graphicsRing || !graphicsQueueMapped) {
@@ -345,6 +460,16 @@ bool RDNA4Driver::submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCo
     if (!pm4Data || dwordCount == 0 || !fenceOut || !graphicsLock) return false;
 
     IOLockLock(graphicsLock);
+    // GB_ADDR_CONFIG carries the memory interleave / RB mapping every SC, CB and
+    // DB address depends on. It is firmware-programmed: this box reads
+    // 0x08200545, the value real Navi 48 hardware reports, so it only needs to be
+    // published (the register is not ours to rewrite). Reading it at the WRONG
+    // dword offset (0x263E instead of regGB_ADDR_CONFIG's 0x13DE) is what once
+    // made the driver believe the interleave was zero.
+    {
+        grbmSelect(0, 0, 0, 0);
+        setProperty("GfxDiag,GbAddrConfig", static_cast<uint64_t>(readGcRegister(kRegGbAddrConfig, 0)), 32);
+    }
     const uint64_t fence = graphicsRing->allocateFence();
     const uint64_t fenceAddr = graphicsFenceGpuAddr();
     if (!fenceAddr) {
@@ -355,15 +480,63 @@ bool RDNA4Driver::submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCo
     PM4BuilderKernel fencePacket;
     fencePacket.emitFenceWrite(fenceAddr, fence);
     const size_t fenceDwords = fencePacket.getPacketCount();
-    const size_t totalDwords = dwordCount + fenceDwords;
-    uint32_t* stream = static_cast<uint32_t*>(IOMalloc(totalDwords * sizeof(uint32_t)));
+
+    // Graphics packets belong to the PFP. The ring is consumed by the ME, which
+    // implements compute-style packets only: an inline draw and every SET_*_REG
+    // in the graphics blocks are accepted and skipped, so the ring drains, the
+    // fence completes and nothing renders.
+    //
+    // Standard GFX ring submission (gfx_v12_0_ring_emit_ib_gfx, Cobalt64
+    // native_s1c_pure.h:build_submit):
+    //   1. CONTEXT_CONTROL (3 dw): load_enable=1, shadow=0
+    //   2. INDIRECT_BUFFER (4 dw): NO VALID bit (the GFX ring does not set it;
+    //      only COMPUTE rings need bit 23). Control = length_dw | (vmid << 24).
+    //   3. RELEASE_MEM fence (8 dw)
+    const bool useIb = graphicsIbGpuAddr && graphicsIbSlotBytes &&
+                       dwordCount <= graphicsIbSlotBytes / 4u;
+    constexpr size_t kIbWrapperDwords = 7u; // 3 dw cntxcntl + 4 dw ib
+    const size_t ringDwords = useIb ? (kIbWrapperDwords + fenceDwords)
+                                    : (dwordCount + fenceDwords);
+    uint32_t* stream = static_cast<uint32_t*>(IOMalloc(ringDwords * sizeof(uint32_t)));
     if (!stream) {
         IOLockUnlock(graphicsLock);
         return false;
     }
-    for (size_t i = 0; i < dwordCount; i++) stream[i] = pm4Data[i];
-    for (size_t i = 0; i < fenceDwords; i++) {
-        stream[dwordCount + i] = fencePacket.getPackets()[i];
+    if (useIb) {
+        const uint32_t slot = graphicsIbSlot;
+        graphicsIbSlot = (graphicsIbSlot + 1u) & 1u;
+        const uint64_t ibAddr = graphicsIbGpuAddr +
+                                static_cast<uint64_t>(slot) * graphicsIbSlotBytes;
+        const uint64_t ibOff = (ibAddr - gmcContext.vramStart);
+        if (ibOff >= vramSize || dwordCount * sizeof(uint32_t) > vramSize - ibOff) {
+            IOFree(stream, ringDwords * sizeof(uint32_t));
+            IOLockUnlock(graphicsLock);
+            return false;
+        }
+        memcpy(const_cast<uint8_t*>(vram) + ibOff, pm4Data,
+               dwordCount * sizeof(uint32_t));
+        gmcHDPFlush(*this);
+
+        // 1. CONTEXT_CONTROL: load_enable only
+        stream[0] = (3u << 30) | (1u << 16) | (GFX12::PKT3_CONTEXT_CONTROL << 8);
+        stream[1] = 0x80000000u;
+        stream[2] = 0u;
+
+        // 2. INDIRECT_BUFFER: no VALID bit (gfx_v12_0_ring_emit_ib_gfx)
+        stream[3] = (3u << 30) | (2u << 16) | (GFX12::PKT3_INDIRECT_BUFFER << 8);
+        stream[4] = static_cast<uint32_t>(ibAddr & 0xFFFFFFFCu);
+        stream[5] = static_cast<uint32_t>(ibAddr >> 32);
+        stream[6] = static_cast<uint32_t>(dwordCount) & 0xFFFFFu; // vmid 0
+
+        // 3. EOP fence
+        for (size_t i = 0; i < fenceDwords; i++) {
+            stream[kIbWrapperDwords + i] = fencePacket.getPackets()[i];
+        }
+    } else {
+        for (size_t i = 0; i < dwordCount; i++) stream[i] = pm4Data[i];
+        for (size_t i = 0; i < fenceDwords; i++) {
+            stream[dwordCount + i] = fencePacket.getPackets()[i];
+        }
     }
 
     // Reclaim whatever the CP already consumed before checking for space.
@@ -376,10 +549,11 @@ bool RDNA4Driver::submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCo
         }
     }
 
-    bool ok = graphicsRing->writePM4(stream, totalDwords);
+    bool ok = graphicsRing->writePM4(stream, ringDwords);
     if (ok) {
         // The CP reads the ring through the BAR, so the PM4 bytes have to be
         // pushed out before the doorbell tells it to look.
+        armNggRingSentinel();
         gmcHDPFlush(*this);
         const uint32_t wptr = graphicsRing->getWritePointer();
         if (graphicsWptrMd) {
@@ -401,10 +575,11 @@ bool RDNA4Driver::submitGraphicsCommands(const uint32_t* pm4Data, size_t dwordCo
         setProperty("GraphicsQueue,MqdRptr", static_cast<uint64_t>(m[kGfxHqdRptr]), 32);
         setProperty("GraphicsQueue,MqdWptr", static_cast<uint64_t>(m[kGfxHqdWptr]), 32);
     }
-    IOFree(stream, totalDwords * sizeof(uint32_t));
+    IOFree(stream, ringDwords * sizeof(uint32_t));
     IOLockUnlock(graphicsLock);
     if (ok) *fenceOut = fence;
-    if (!ok) LOG_ERROR("submitGraphicsCommands: ring refused %zu dwords", totalDwords);
+    if (!ok) LOG_ERROR("submitGraphicsCommands: ring refused %zu dwords (ib=%u)",
+                       ringDwords, useIb ? 1u : 0u);
     return ok;
 }
 
@@ -413,8 +588,207 @@ bool RDNA4Driver::waitForGraphicsFence(uint64_t fenceValue, uint64_t timeoutMS) 
     const bool reached = graphicsRing->waitForFence(fenceValue, timeoutMS);
     if (graphicsLock) IOLockLock(graphicsLock);
     snapshotGraphicsQueue(reached ? "Complete" : "Timeout");
+    // Both on success and on timeout: a wedged draw is exactly the case where
+    // knowing whether a vertex wave ran matters most.
+    scanNggRing();
+    if (reached) logGraphicsStateReadback();
+    if (!reached) resetGraphicsQueue();
     if (graphicsLock) IOLockUnlock(graphicsLock);
     return reached;
+}
+
+namespace {
+// The attribute ring is split per shader engine: SE n owns
+// [base + n*0x160000, +0x160000). The GE picks the SE for a subgroup, so
+// arming or scanning only the first region can only ever observe SE0.
+constexpr uint32_t kNggSeCount = GFX12::kAttributeRingTotal / GFX12::kAttributeRingPerSE;
+constexpr uint32_t kNggSentinelBytesPerSe = 4096;
+} // namespace
+
+void RDNA4Driver::armNggRingSentinel() {
+    // Stamp a known pattern into the head of every SE's attribute ring region
+    // before a submission. Whatever a vertex wave stores lands somewhere in
+    // one of them, so a post-fence mismatch proves a store happened even when
+    // the exact offset (gs_attr_offset) and the SE are unknown.
+    if (!nggRingGpuAddr || !nggRingSize || !vram) return;
+    if (nggRingGpuAddr < gmcContext.vramStart) return;
+    const uint64_t base = nggRingGpuAddr - gmcContext.vramStart;
+    for (uint32_t se = 0; se < kNggSeCount; se++) {
+        const uint64_t region = static_cast<uint64_t>(se) * GFX12::kAttributeRingPerSE;
+        if (region + kNggSentinelBytesPerSe > nggRingSize) break;
+        if (base >= vramSize || region >= vramSize - base) break;
+        if (kNggSentinelBytesPerSe > vramSize - base - region) break;
+        uint32_t* head = reinterpret_cast<uint32_t*>(
+            const_cast<uint8_t*>(vram) + base + region);
+        for (uint32_t i = 0; i < kNggSentinelBytesPerSe / 4u; i++) head[i] = kNggSentinel;
+    }
+    gmcHDPFlush(*this);
+}
+
+void RDNA4Driver::scanNggRing() {
+    // The SPI attribute ring is the only place a vertex stage's exports land
+    // that the driver can read back: hardware writes it, userspace never does.
+    // A non-zero count therefore proves the ES/GS wave actually ran.
+    if (!nggRingGpuAddr || !nggRingSize || !vram) return;
+    if (nggRingGpuAddr < gmcContext.vramStart) return;
+    const uint64_t offset = nggRingGpuAddr - gmcContext.vramStart;
+    if (offset >= vramSize || nggRingSize > vramSize - offset) return;
+    gmcHDPFlush(*this);
+    const volatile uint32_t* ring = reinterpret_cast<const volatile uint32_t*>(
+        const_cast<uint8_t*>(vram) + offset);
+    // Scan the whole attribute-ring region, not a fixed window: one SE's region
+    // is 0x160000 bytes, so a 256 KiB window never reached SE1..3.
+    const uint32_t attributeDwords = GFX12::kAttributeRingTotal / 4u;
+    const uint32_t dwords = attributeDwords < nggRingSize / 4u
+        ? attributeDwords : nggRingSize / 4u;
+    uint32_t touched = 0;
+    char key[64];
+    for (uint32_t se = 0; se < kNggSeCount; se++) {
+        const uint32_t regionDwords = GFX12::kAttributeRingPerSE / 4u;
+        if (static_cast<uint64_t>(se + 1u) * regionDwords > dwords) break;
+        const uint32_t armed = kNggSentinelBytesPerSe / 4u;
+        uint32_t seTouched = 0;
+        for (uint32_t i = 0; i < armed; i++) {
+            seTouched += (ring[se * regionDwords + i] != kNggSentinel);
+        }
+        touched += seTouched;
+        snprintf(key, sizeof(key), "GfxDiag,NggRingTouchedSe%u", se);
+        setProperty(key, static_cast<uint64_t>(seTouched), 32);
+    }
+    setProperty("GfxDiag,NggRingSentinelTouched", static_cast<uint64_t>(touched), 32);
+    uint32_t nonZero = 0;
+    uint32_t firstIndex = 0, firstValue = 0;
+    bool haveFirst = false;
+    for (uint32_t i = 0; i < dwords; i++) {
+        const uint32_t value = ring[i];
+        if (!value) continue;
+        nonZero++;
+        if (!haveFirst) { haveFirst = true; firstIndex = i; firstValue = value; }
+    }
+    // Read-only: this used to reprogram GB_ADDR_CONFIG with a Navi-era value on
+    // every fence completion, i.e. rewrite the memory-interleave word between
+    // submissions with a layout that was never derived for this chip.
+    // GB_ADDR_CONFIG is broadcast: a read with an instance selected returns 0,
+    // so a zero here says nothing about the front end either way.
+    {
+        const uint32_t gbAddrConfig = readGcRegister(kRegGbAddrConfig, 0);
+        const uint32_t rbBackendDisable = readGcRegister(kRegCcRbBackendDisable, 0);
+        setProperty("GfxDiag,GbAddrConfigValue", static_cast<uint64_t>(gbAddrConfig), 32);
+        setProperty("GfxDiag,CcRbBackendDisable", static_cast<uint64_t>(rbBackendDisable), 32);
+        // Live status: GB_BACKEND_MAP is the per-SE backend mapping the CB/DB
+        // use, GRBM_STATUS says whether the front end is idle after the fence.
+        setProperty("GfxDiag,GbBackendMap",
+                    static_cast<uint64_t>(readGcRegister(0x13DFu, 0)), 32);
+        setProperty("GfxDiag,GrbmStatus",
+                    static_cast<uint64_t>(readGcRegister(0x0DA4u, 0)), 32);
+        setProperty("GfxDiag,GrbmStatus2",
+                    static_cast<uint64_t>(readGcRegister(0x0DA2u, 0)), 32);
+    }
+    setProperty("GfxDiag,NggRingNonZero", static_cast<uint64_t>(nonZero), 32);
+    setProperty("GfxDiag,NggRingFirstIndex", static_cast<uint64_t>(haveFirst ? firstIndex : 0xFFFFFFFFu), 32);
+    setProperty("GfxDiag,NggRingFirstValue", static_cast<uint64_t>(firstValue), 32);
+
+    // Scan the WHOLE NGG allocation, not just the attribute-ring slice: if the
+    // GE hands out a gs_attr_offset past the attribute region, the vertex
+    // stage's parameter stores land in the position/primitive rings and the
+    // attribute-only scan reports an untouched ring.
+    {
+        const uint32_t allDwords = nggRingSize / 4u;
+        const volatile uint32_t* all = reinterpret_cast<const volatile uint32_t*>(
+            const_cast<uint8_t*>(vram) + offset);
+        const uint32_t armedDwords = kNggSentinelBytesPerSe / 4u;
+        uint64_t allNonZero = 0;
+        uint32_t allFirstIndex = 0xFFFFFFFFu, allFirstValue = 0;
+        for (uint32_t i = 0; i < allDwords; i++) {
+            const uint32_t v = all[i];
+            if (!v) continue;
+            // Skip the sentinels stamped at the head of every SE region.
+            const uint32_t seRegion = GFX12::kAttributeRingPerSE / 4u;
+            const bool isSentinel = (i % seRegion) < armedDwords && v == kNggSentinel;
+            if (isSentinel) continue;
+            allNonZero++;
+            if (allFirstIndex == 0xFFFFFFFFu) { allFirstIndex = i; allFirstValue = v; }
+        }
+        setProperty("GfxDiag,NggAllNonZero", allNonZero, 32);
+        setProperty("GfxDiag,NggAllFirstIndex", static_cast<uint64_t>(allFirstIndex), 32);
+        setProperty("GfxDiag,NggAllFirstValue", static_cast<uint64_t>(allFirstValue), 32);
+        LOG("GFX NGG whole-allocation scan: %llu dwords non-zero, first at %d = 0x%08x",
+            allNonZero, allFirstIndex == 0xFFFFFFFFu ? -1 : static_cast<int>(allFirstIndex), allFirstValue);
+    }
+
+    // The position and primitive rings sit after the attribute ring in the same
+    // allocation. The GE writes them as it consumes the vertex exports, so a
+    // non-zero count there is the only direct evidence that primitives reached
+    // the rasterizer's input.
+    struct RingScan { const char* name; uint32_t offset; uint32_t length; };
+    const RingScan rings[] = {
+        { "Pos",  GFX12::kGePosRingOffset,  0x400000u },
+        { "Prim", GFX12::kGePrimRingOffset, 0x100000u },
+    };
+    for (const RingScan& r : rings) {
+        if (static_cast<uint64_t>(r.offset) + r.length > nggRingSize) continue;
+        const volatile uint32_t* words = reinterpret_cast<const volatile uint32_t*>(
+            const_cast<uint8_t*>(vram) + offset + r.offset);
+        const uint32_t count = r.length / 4u;
+        uint32_t firstIndexR = 0xFFFFFFFFu, firstValueR = 0;
+        uint64_t nonzero = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t v = words[i];
+            if (!v) continue;
+            nonzero++;
+            if (firstIndexR == 0xFFFFFFFFu) { firstIndexR = i; firstValueR = v; }
+        }
+        snprintf(key, sizeof(key), "GfxDiag,Ngg%sNonZero", r.name);
+        setProperty(key, nonzero, 32);
+        snprintf(key, sizeof(key), "GfxDiag,Ngg%sFirstIndex", r.name);
+        setProperty(key, static_cast<uint64_t>(firstIndexR), 32);
+        snprintf(key, sizeof(key), "GfxDiag,Ngg%sFirstValue", r.name);
+        setProperty(key, static_cast<uint64_t>(firstValueR), 32);
+        // Head dump: the first 16 dwords show the ring's entry layout and, for
+        // the position ring, the exported coordinates themselves.
+        for (uint32_t i = 0; i < 16u && i < count; i++) {
+            snprintf(key, sizeof(key), "GfxDiag,Ngg%sHead%02u", r.name, i);
+            setProperty(key, static_cast<uint64_t>(words[i]), 32);
+        }
+        LOG("GFX NGG %s ring: %llu/%u dwords non-zero, first at %d = 0x%08x",
+            r.name, nonzero, count,
+            firstIndexR == 0xFFFFFFFFu ? -1 : static_cast<int>(firstIndexR), firstValueR);
+    }
+    LOG("GFX NGG ring scan: %u dwords touched across %u SE, %u/%u dwords non-zero, first at %d = 0x%08x",
+        touched, kNggSeCount, nonZero, dwords,
+        haveFirst ? static_cast<int>(firstIndex) : -1, firstValue);
+}
+
+void RDNA4Driver::logGraphicsStateReadback() {
+    // MMIO readback of the state a draw depends on. Published (not logged once)
+    // so every submission's actual context can be compared against what the
+    // encoder believes it wrote.
+    struct Reg { const char* name; uint32_t byteOffset; };
+    static const Reg regs[] = {
+        {"stagesEn", 0x28a98}, {"posFormat", 0x2864c}, {"cbColor0Base", 0x28c60},
+        {"cbColor0Info", 0x28ec0}, {"paClVteCntl", 0x28814},
+        {"primType", 0x30908}, {"geCntl", 0x3096c}, {"gsMaxVertOut", 0x28b38},
+        {"pgmLoGs", 0x0b210}, {"rsrc1Gs", 0x0b228}, {"userDataGs0", 0x0b230},
+        {"pgmLoEs", 0x0b224}, {"pgmHiEs", 0x0b218}, {"rsrc2Gs", 0x0b22c},
+        {"rsrc3Gs", 0x0b21c}, {"rsrc4Gs", 0x0b220},
+        {"pgmLoPs", 0x0b020}, {"rsrc1Ps", 0x0b028}, {"rsrc2Ps", 0x0b02c},
+        {"numInstances", 0x30934}, {"gsInstCnt", 0x28b3c}, {"gsOutPrim", 0x30998},
+        {"binner0", 0x28c44}, {"modeCntl0", 0x28a48}, {"modeCntl1", 0x28a4c},
+        {"cbColorControl", 0x28858}, {"idxFormat", 0x28648}, {"colFormat", 0x28654},
+        {"maxOutPerSg", 0x287fc}, {"nggSubgrp", 0x28b4c},
+        {"psInputEna", 0x2865c}, {"psInputAddr", 0x28660}, {"gsOutCfgPs", 0x0b0c4},
+        {"clipCntl", 0x28810}, {"scModeCntl", 0x2881c}, {"aaMaskLo", 0x28c38},
+    };
+    // Context registers are read through the currently selected GC instance;
+    // without this the reads land on whatever block the last compute call
+    // selected and come back as zero.
+    grbmSelect(0, 0, 0, 0);
+    char key[64];
+    for (const Reg& reg : regs) {
+        const uint32_t value = readGcRegister(reg.byteOffset >> 2, 0);
+        snprintf(key, sizeof(key), "GfxDiag,Rd,%s", reg.name);
+        setProperty(key, static_cast<uint64_t>(value), 32);
+    }
 }
 
 uint64_t RDNA4Driver::graphicsFenceGpuAddr() {

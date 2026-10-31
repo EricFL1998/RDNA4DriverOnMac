@@ -75,7 +75,7 @@ LDFLAGS = -arch $(ARCH) -target $(ARCH)-apple-macos11.0 \
 	-Wl,-no_deduplicate
 
 # Targets
-.PHONY: all clean install unload status test-pm4
+.PHONY: all clean install unload status test-pm4 test-user-client
 
 all: $(KEXT_DIR)
 
@@ -89,7 +89,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "Compiling $<..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KEXT_DIR): $(OBJECTS)
+$(KEXT_DIR): $(OBJECTS) Info.plist
 	@echo "Building kext..."
 	@mkdir -p $(MACOS) $(RESOURCES)
 
@@ -115,7 +115,7 @@ clean:
 
 # Host-side checks: PM4 encoder bytes, MES API frame layout, GFX ring
 # doorbell. No hardware, no IOKit (tests/host-shim stands in for IOLib).
-test-pm4:
+test-pm4: test-user-client
 	@mkdir -p $(BUILD_DIR)/tests
 	$(CXX) -std=c++17 -Wall -Wextra -I$(SRC_DIR)/hardware \
 		$(SRC_DIR)/hardware/GraphicsPM4Builder.cpp tests/test_graphics_pm4.cpp \
@@ -136,6 +136,14 @@ test-pm4:
 		$(SRC_DIR)/hardware/GARTUtils.cpp tests/test_gart_utils.cpp \
 		-o $(BUILD_DIR)/tests/test_gart_utils
 	./$(BUILD_DIR)/tests/test_gart_utils
+
+test-user-client:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -Itests/host-shim \
+		tests/test_user_client_lifetime.cpp $(SRC_DIR)/hardware/PM4BuilderKernel.cpp \
+		-o $(BUILD_DIR)/tests/test_user_client_lifetime
+	./$(BUILD_DIR)/tests/test_user_client_lifetime
+	python3 tests/run_vram_allocator_test.py
 
 install: $(KEXT_DIR)
 	@echo "Installing kext to /Library/Extensions..."

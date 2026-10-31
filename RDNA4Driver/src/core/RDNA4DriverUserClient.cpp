@@ -1,6 +1,5 @@
 #include "RDNA4DriverUserClient.hpp"
 #include "RDNA4Driver.hpp"
-#include "../hardware/PM4BuilderKernel.hpp"
 #include <IOKit/IOLib.h>
 
 #define super IOUserClient
@@ -11,6 +10,14 @@ namespace {
 // the available space is re-derived per submission, so this is a sanity bound
 // rather than an allocator limit.
 constexpr uint32_t kMaxSubmitDwords = 256u * 1024u;
+class ClientLockGuard {
+    IOLock* lock;
+public:
+    explicit ClientLockGuard(IOLock* value) : lock(value) {
+        if (lock) IOLockLock(lock);
+    }
+    ~ClientLockGuard() { if (lock) IOLockUnlock(lock); }
+};
 } // namespace
 
 bool RDNA4DriverUserClient::start(IOService* provider) {
@@ -23,6 +30,13 @@ bool RDNA4DriverUserClient::start(IOService* provider) {
         return false;
     }
 
+    clientLock = IOLockAlloc();
+    if (!clientLock) {
+        driver = nullptr;
+        super::stop(provider);
+        return false;
+    }
+
     IOLog("RDNA4UserClient: started (user window GPU 0x%llx, %llu MiB)\n",
           static_cast<unsigned long long>(driver->userHeapGpuAddr()),
           static_cast<unsigned long long>(driver->userHeapSize() >> 20));
@@ -30,13 +44,51 @@ bool RDNA4DriverUserClient::start(IOService* provider) {
 }
 
 void RDNA4DriverUserClient::stop(IOService* provider) {
-    driver = nullptr;
+    {
+        ClientLockGuard guard(clientLock);
+        releaseAllocations();
+        driver = nullptr;
+    }
     super::stop(provider);
 }
 
+void RDNA4DriverUserClient::free() {
+    if (clientLock) {
+        IOLockFree(clientLock);
+        clientLock = nullptr;
+    }
+    super::free();
+}
+
+void RDNA4DriverUserClient::releaseAllocations() {
+    closing = true;
+    if (!driver || allocationCount == 0) return;
+
+    // The process can die immediately after submission. Its ranges must not
+    // be handed to the next process while either queue can still access them.
+    const bool computeDone = !lastComputeFence ||
+        driver->waitForComputeFence(lastComputeFence, 5000);
+    const bool graphicsDone = !lastGraphicsFence ||
+        driver->waitForGraphicsFence(lastGraphicsFence, 5000);
+    if (!computeDone || !graphicsDone) {
+        IOLog("RDNA4UserClient: retaining %u allocations: GPU completion unconfirmed\n",
+              allocationCount);
+        return;
+    }
+
+    const uint32_t count = allocationCount;
+    while (allocationCount) driver->freeVRAMBuffer(allocations[--allocationCount]);
+    lastComputeFence = lastGraphicsFence = 0;
+    IOLog("RDNA4UserClient: reclaimed %u allocations on close\n", count);
+}
+
 IOReturn RDNA4DriverUserClient::clientClose() {
+    {
+        ClientLockGuard guard(clientLock);
+        releaseAllocations();
+    }
     if (!isInactive()) terminate();
-    return super::clientClose();
+    return kIOReturnSuccess;
 }
 
 IOReturn RDNA4DriverUserClient::clientDied() {
@@ -46,12 +98,13 @@ IOReturn RDNA4DriverUserClient::clientDied() {
 IOReturn RDNA4DriverUserClient::clientMemoryForType(UInt32 type,
                                                     IOOptionBits* options,
                                                     IOMemoryDescriptor** memory) {
+    ClientLockGuard guard(clientLock);
     if (!memory) return kIOReturnBadArgument;
     *memory = nullptr;
     if (options) *options = 0;
 
     if (type != 0) return kIOReturnUnsupported;
-    if (!driver) return kIOReturnNotAttached;
+    if (!driver || closing) return kIOReturnNotAttached;
 
     // A fresh descriptor per mapping: IOUserClient owns what we hand back and
     // releases it when the client goes away.
@@ -64,7 +117,7 @@ IOReturn RDNA4DriverUserClient::clientMemoryForType(UInt32 type,
     return kIOReturnSuccess;
 }
 
-const IOExternalMethodDispatch RDNA4DriverUserClient::sMethods[8] = {
+const IOExternalMethodDispatch RDNA4DriverUserClient::sMethods[9] = {
     { &RDNA4DriverUserClient::sGetDeviceInfo,    0, 0, 4, 0 },
     { &RDNA4DriverUserClient::sAllocateBuffer,   1, 0, 1, 0 },
     { &RDNA4DriverUserClient::sFreeBuffer,       1, 0, 0, 0 },
@@ -73,6 +126,7 @@ const IOExternalMethodDispatch RDNA4DriverUserClient::sMethods[8] = {
     { &RDNA4DriverUserClient::sSubmitGraphics,   0, kIOUCVariableStructureSize, 1, 0 },
     { &RDNA4DriverUserClient::sWaitGraphicsFence, 2, 0, 0, 0 },
     { &RDNA4DriverUserClient::sGetGraphicsInfo,  0, 0, 4, 0 },
+    { &RDNA4DriverUserClient::sGetNggRing,       0, 0, 2, 0 },
 };
 
 IOReturn RDNA4DriverUserClient::externalMethod(uint32_t selector,
@@ -82,6 +136,9 @@ IOReturn RDNA4DriverUserClient::externalMethod(uint32_t selector,
     (void)dispatch;
     (void)target;
     (void)reference;
+
+    ClientLockGuard guard(clientLock);
+    if (!driver || closing) return kIOReturnNotAttached;
 
     if (!arguments || selector >= (sizeof(sMethods) / sizeof(sMethods[0])) ||
         !sMethods[selector].function) {
@@ -123,11 +180,13 @@ IOReturn RDNA4DriverUserClient::sAllocateBuffer(OSObject* target, void* referenc
     if (size == 0 || size > self->driver->userHeapSize()) {
         return kIOReturnBadArgument;
     }
+    if (self->allocationCount == kMaxAllocations) return kIOReturnNoMemory;
 
     const uint64_t addr = self->driver->allocateUserVRAMBuffer(
         static_cast<size_t>(size));
     if (!addr) return kIOReturnNoMemory;
 
+    self->allocations[self->allocationCount++] = addr;
     arguments->scalarOutput[0] = addr;
     return kIOReturnSuccess;
 }
@@ -151,8 +210,13 @@ IOReturn RDNA4DriverUserClient::sFreeBuffer(OSObject* target, void* reference,
         return kIOReturnBadArgument;
     }
 
-    self->driver->freeVRAMBuffer(addr);
-    return kIOReturnSuccess;
+    for (uint32_t i = 0; i < self->allocationCount; ++i) {
+        if (self->allocations[i] != addr) continue;
+        self->driver->freeVRAMBuffer(addr);
+        self->allocations[i] = self->allocations[--self->allocationCount];
+        return kIOReturnSuccess;
+    }
+    return kIOReturnBadArgument;
 }
 
 IOReturn RDNA4DriverUserClient::sSubmitCommands(OSObject* target, void* reference,
@@ -172,31 +236,12 @@ IOReturn RDNA4DriverUserClient::sSubmitCommands(OSObject* target, void* referenc
     const auto* pm4 = static_cast<const uint32_t*>(arguments->structureInput);
     const size_t dwords = bytes / 4;
 
-    // The fence value must be allocated by the driver: the ring owns the
-    // counter, and a user-space counter would never match the slot the GPU
-    // writes. The caller is told the value the fence packet carries.
-    const uint64_t fence = self->driver->allocFenceValue();
-    const uint64_t fenceAddr = self->driver->computeFenceGpuAddr();
+    uint64_t fence = 0;
+    if (!self->driver->submitUserComputeCommands(pm4, dwords, &fence)) {
+        return kIOReturnNoResources;
+    }
 
-    PM4BuilderKernel fencePacket;
-    fencePacket.emitFenceWrite(fenceAddr, fence);
-    const size_t fenceDwords = fencePacket.getPacketCount();
-
-    // The user's stream and our fence packet go out as one submission so the
-    // CP cannot run a partially written job.
-    const size_t totalDwords = dwords + fenceDwords;
-    uint32_t* stream = static_cast<uint32_t*>(
-        IOMalloc(totalDwords * sizeof(uint32_t)));
-    if (!stream) return kIOReturnNoMemory;
-    for (size_t i = 0; i < dwords; i++) stream[i] = pm4[i];
-    for (size_t i = 0; i < fenceDwords; i++) stream[dwords + i] = fencePacket.getPackets()[i];
-
-    const bool submitted =
-        self->driver->submitComputeCommands(stream, totalDwords);
-    IOFree(stream, totalDwords * sizeof(uint32_t));
-
-    if (!submitted) return kIOReturnNoResources;
-
+    self->lastComputeFence = fence;
     arguments->scalarOutput[0] = fence;
     return kIOReturnSuccess;
 }
@@ -216,9 +261,9 @@ IOReturn RDNA4DriverUserClient::sWaitFence(OSObject* target, void* reference,
     // otherwise mean "wait ~57 days"; clamp to a sane ceiling.
     if (timeoutMS == 0 || timeoutMS > 60000) timeoutMS = 60000;
 
-    return self->driver->waitForComputeFence(fence, timeoutMS)
-        ? kIOReturnSuccess
-        : kIOReturnTimeout;
+    if (!self->driver->waitForComputeFence(fence, timeoutMS)) return kIOReturnTimeout;
+    if (fence >= self->lastComputeFence) self->lastComputeFence = 0;
+    return kIOReturnSuccess;
 }
 
 IOReturn RDNA4DriverUserClient::sSubmitGraphics(OSObject* target, void* reference,
@@ -243,6 +288,7 @@ IOReturn RDNA4DriverUserClient::sSubmitGraphics(OSObject* target, void* referenc
         return kIOReturnNoResources;
     }
 
+    self->lastGraphicsFence = fence;
     arguments->scalarOutput[0] = fence;
     return kIOReturnSuccess;
 }
@@ -257,9 +303,10 @@ IOReturn RDNA4DriverUserClient::sWaitGraphicsFence(OSObject* target, void* refer
     }
     uint64_t timeoutMS = arguments->scalarInput[1];
     if (timeoutMS == 0 || timeoutMS > 60000) timeoutMS = 60000;
-    return self->driver->waitForGraphicsFence(arguments->scalarInput[0], timeoutMS)
-        ? kIOReturnSuccess
-        : kIOReturnTimeout;
+    const uint64_t fence = arguments->scalarInput[0];
+    if (!self->driver->waitForGraphicsFence(fence, timeoutMS)) return kIOReturnTimeout;
+    if (fence >= self->lastGraphicsFence) self->lastGraphicsFence = 0;
+    return kIOReturnSuccess;
 }
 
 IOReturn RDNA4DriverUserClient::sGetGraphicsInfo(OSObject* target, void* reference,
@@ -274,5 +321,18 @@ IOReturn RDNA4DriverUserClient::sGetGraphicsInfo(OSObject* target, void* referen
     arguments->scalarOutput[1] = self->driver->graphicsFenceGpuAddr();
     arguments->scalarOutput[2] = 0;
     arguments->scalarOutput[3] = 0;
+    return kIOReturnSuccess;
+}
+
+IOReturn RDNA4DriverUserClient::sGetNggRing(OSObject* target, void* reference,
+                                            IOExternalMethodArguments* arguments) {
+    (void)reference;
+    RDNA4DriverUserClient* self = OSDynamicCast(RDNA4DriverUserClient, target);
+    if (!self || !self->driver) return kIOReturnNotAttached;
+    if (!arguments || arguments->scalarOutputCount < 2 || !arguments->scalarOutput) {
+        return kIOReturnBadArgument;
+    }
+    arguments->scalarOutput[0] = self->driver->nggRingBase();
+    arguments->scalarOutput[1] = self->driver->nggRingBytes();
     return kIOReturnSuccess;
 }

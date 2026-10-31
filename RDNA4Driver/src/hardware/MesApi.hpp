@@ -26,6 +26,7 @@ enum Opcode : uint32_t {
     kOpSetHwResources = 0,
     kOpAddQueue = 2,
     kOpRemoveQueue = 3,
+    kOpReset = 8,
     kOpQuerySchedulerStatus = 11,
     kOpSetHwResources1 = 19,
 };
@@ -44,6 +45,10 @@ constexpr uint32_t kMqdAddrHi = 21;
 constexpr uint32_t kWptrAddrLo = 22;
 constexpr uint32_t kWptrAddrHi = 23;
 constexpr uint32_t kQueueType = 28;
+// These are the offsets this MES firmware accepts, verified on hardware: an
+// attempt to move them to the mes_v12_api_def.h x86_64 positions (38/39/40..43)
+// made ADD_QUEUE time out with no api_status write-back, so the layout in use
+// here is the one below.
 constexpr uint32_t kVmContextCntl = 36;
 constexpr uint32_t kFlags = 37;
 constexpr uint32_t kFenceAddrLo = 38;
@@ -143,7 +148,9 @@ inline uint32_t nextCompletionFence(uint32_t current) {
 inline uint32_t completionStatusDword(uint32_t opcode) {
     switch (opcode) {
         case kOpSetHwResources: return 50;
-        case kOpAddQueue: return 38;
+        case kOpAddQueue: return AddQueue::kFenceAddrLo;
+        case kOpRemoveQueue: return 6;   // MES_RemoveQueue.api_status at dword 6
+        case kOpReset: return 28;
         case kOpQuerySchedulerStatus:
         case kOpSetHwResources1: return 2;
         default: return 0;
@@ -179,6 +186,53 @@ inline void buildAddQueueLegacy(uint32_t* pkt, const AddQueueInput& in) {
     pkt[AddQueue::kFenceValueHi] = static_cast<uint32_t>(in.fenceValue >> 32);
     pkt[AddQueue::kPipeId] = in.pipe;
     pkt[AddQueue::kQueueId] = in.queue;
+}
+
+struct ResetQueueInput {
+    uint32_t doorbellOffset;
+    uint64_t mqdAddr;
+    uint64_t wptrAddr;
+    uint32_t pipe;
+    uint32_t queue;
+    uint32_t vmid;
+};
+
+// REMOVE_QUEUE (mes_v12_api_def.h MESAPI__REMOVE_QUEUE): doorbell_offset 4,
+// gang_context_addr 8, flags 16, api_status 24..39, pipe_id 40, queue_id 44,
+// queue_type 60. flags bit 3 = unmap_legacy_queue.
+constexpr uint32_t kRemoveUnmapLegacyQueue = 1u << 3;
+
+inline uint32_t completionStatusDwordRemove() { return 6; }
+
+inline void buildRemoveQueue(uint32_t* pkt, const ResetQueueInput& in) {
+    for (uint32_t i = 0; i < kFrameDwords; i++) pkt[i] = 0;
+    pkt[0] = header(kOpRemoveQueue);
+    pkt[1] = in.doorbellOffset;
+    pkt[4] = kRemoveUnmapLegacyQueue;
+    pkt[10] = in.pipe;
+    pkt[11] = in.queue;
+    pkt[15] = kQueueTypeGfx;
+}
+
+// RESET flags (mes_v12_api_def.h): 0 reset_queue_only, 1 hang_detect_then_reset,
+// 2 hang_detect_only, 3 reset_legacy_gfx.
+constexpr uint32_t kResetFlag_queueOnly = 1u << 0;
+constexpr uint32_t kResetFlag_legacyGfx = 1u << 3;
+
+inline void buildResetQueueLegacy(uint32_t* pkt, const ResetQueueInput& in,
+                                  uint32_t flags = kResetFlag_legacyGfx) {
+    for (uint32_t i = 0; i < kFrameDwords; i++) pkt[i] = 0;
+    pkt[0] = header(kOpReset);
+    pkt[1] = flags;
+    pkt[8] = kQueueTypeGfx;
+    pkt[9] = in.pipe;
+    pkt[10] = in.queue;
+    pkt[11] = in.vmid;
+    pkt[12] = static_cast<uint32_t>(in.mqdAddr);
+    pkt[13] = static_cast<uint32_t>(in.mqdAddr >> 32);
+    pkt[14] = in.doorbellOffset;
+    pkt[16] = static_cast<uint32_t>(in.wptrAddr);
+    pkt[17] = static_cast<uint32_t>(in.wptrAddr >> 32);
 }
 
 } // namespace MesApi

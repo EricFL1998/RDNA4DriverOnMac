@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.0.2</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>3</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 RDNA4 Project. All rights reserved.</string>
 	
@@ -31,11 +31,44 @@
 	<key>IOMatchCategory</key>
 	<string>IOAccelerator</string>
 	
-	<!-- Metal specific keys -->
+	<!-- The matching IOAccelerator's properties select this bundle/class. -->
 	<key>MetalPluginName</key>
 	<string>RDNA4Metal</string>
 	<key>MetalPluginClassName</key>
 	<string>RDNA4Device</string>
+	<key>MetalPluginType</key>
+	<string>GPU</string>
+
+	<key>NSPrincipalClass</key>
+	<string>RDNA4Device</string>
+	
+	<!-- IOKit Personalities for Metal device matching -->
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RDNA4Metal</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.rdna4.metal</string>
+			<key>IOClass</key>
+			<string>IOService</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0x75501002</string>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x75501002 0x75601002</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOProbeScore</key>
+			<integer>6000</integer>
+			<key>MetalPluginName</key>
+			<string>RDNA4Metal</string>
+			<key>MetalPluginClassName</key>
+			<string>RDNA4Device</string>
+			<key>MetalPluginType</key>
+			<string>GPU</string>
+		</dict>
+	</dict>
 	
 	<!-- Device support -->
 	<key>IOPCIPrimaryMatch</key>
@@ -47,7 +80,7 @@
 		<key>SupportsComputeShaders</key>
 		<true/>
 		<key>SupportsRenderShaders</key>
-		<false/>
+		<true/>
 		<key>SupportsIndirectCommandBuffers</key>
 		<false/>
 		<key>SupportsArgumentBuffers</key>
@@ -60,7 +93,7 @@
 	
 	<!-- Version info -->
 	<key>DriverVersion</key>
-	<string>1.0.0</string>
+	<string>1.0.2</string>
 	<key>DriverDate</key>
 	<string>2026-10-30</string>
 	<key>SupportedGPUs</key>

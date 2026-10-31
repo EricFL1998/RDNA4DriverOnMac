@@ -102,7 +102,7 @@ bool RDNA4Accel::publishDeviceProperties() {
 
     // Must match navi48-native/metal-bundle/Info.plist.
     setProperty("MetalPluginClassName", "RDNA4Device");
-    setProperty("MetalPluginName", "RDNA4");
+    setProperty("MetalPluginName", "RDNA4Metal");
     setProperty("MetalPluginType", "Device");
     setProperty("MetalStatisticsName", "RDNA4");
 
