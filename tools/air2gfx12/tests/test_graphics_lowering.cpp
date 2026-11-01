@@ -8,6 +8,7 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 
@@ -130,11 +131,16 @@ static void testVertex() {
     check(code.find("global_store_b128") != std::string::npos,
           "compiled ring write is a 16-byte flat store");
     // ac_nir_lower_intrinsics_to_args.c: the ring slot is selected by
-    // gs_attr_offset (s5) shifted into bytes; without it every store lands in
-    // the first slot and the fragment stage reads zeros.
-    // The varying is published into the vertex buffer, which the shader can
-    // write; the attribute ring's own write path drops the store on this chip.
-    check(code.find("offset:64") != std::string::npos, "varying slots are published in the vertex buffer");
+    // gs_attr_offset (s5) shifted into bytes. It is a runtime value (the GE's
+    // per-SE ring slice), so the store must carry it in the address - a folded
+    // constant only ever hits one slice.
+    check(code.find("s_and_b32 s") != std::string::npos &&
+          code.find("0x7fff") != std::string::npos,
+          "ring address folds gs_attr_offset in from the wave SGPR");
+    check(code.find("s[8:9]") != std::string::npos,
+          "ring store uses the attribute-ring descriptor as its base");
+    check(code.find("s_wait_storecnt") != std::string::npos,
+          "ring stores are committed with a storecnt wait before the primitive export");
 }
 
 static void testFragment() {
@@ -155,14 +161,48 @@ static void testFragment() {
             call->getCalledFunction()->getIntrinsicID() != llvm::Intrinsic::amdgcn_lds_param_load) continue;
         ++legacyParamLoads;
     }
-    check(legacyParamLoads == 0,
-          "interpolation does not depend on the parameter cache (ds_param_load)");
+    check(legacyParamLoads == 3,
+          "each colour channel is read from the parameter cache (ds_param_load)");
     check(!llvm::verifyModule(*module, &llvm::errs()), "fragment IR is valid");
+    air2gfx12::GFX12Emitter emitter(air2gfx12::ShaderStage::Fragment);
+    check(emitter.emitAssembly(*module, "/tmp/air2gfx12-test-fragment.s", &reason),
+          "LLVM accepts the parameter-cache pixel shader");
+    std::ifstream assembly("/tmp/air2gfx12-test-fragment.s");
+    std::string code((std::istreambuf_iterator<char>(assembly)), {});
+    // M0 is the primitive mask; without it every lane reads the same vertex.
+    check(code.find("s_mov_b32 m0, s4") != std::string::npos,
+          "lds_param_load runs against the primitive mask in s4");
+    // aco emits lds_param_load then v_interp_p10/p2_f32_inreg; the load alone
+    // only produces this lane's vertex value, not an interpolated one.
+    check(code.find("v_interp_p10_f32") != std::string::npos &&
+          code.find("v_interp_p2_f32") != std::string::npos,
+          "barycentric interpolation follows the parameter-cache load");
+}
+
+static void testVaryingFallback() {
+    setenv("N48_VB_PARAM", "1", 1);
+    llvm::LLVMContext context;
+    llvm::SMDiagnostic error;
+    auto module = llvm::parseAssemblyString(vertexIR, error, context);
+    std::string reason;
+    auto* entry = llvm::dyn_cast_or_null<llvm::Function>(
+        air2gfx12::lowerGraphicsFunction(*module->getFunction("vertexShader"),
+            air2gfx12::ShaderStage::Vertex, &reason));
+    check(entry != nullptr, "lower vertex fixture with the vertex-buffer fallback");
+    air2gfx12::GFX12Emitter emitter(air2gfx12::ShaderStage::Vertex);
+    check(emitter.emitAssembly(*module, "/tmp/air2gfx12-test-vertex-vb.s", &reason),
+          "LLVM accepts the vertex-buffer fallback");
+    std::ifstream assembly("/tmp/air2gfx12-test-vertex-vb.s");
+    std::string code((std::istreambuf_iterator<char>(assembly)), {});
+    check(code.find("offset:64") != std::string::npos,
+          "N48_VB_PARAM=1 publishes varyings in the vertex buffer");
+    unsetenv("N48_VB_PARAM");
 }
 
 int main() {
     testVertex();
     testFragment();
+    testVaryingFallback();
     std::printf("RESULT: %u failures\n", failures);
     return failures ? 1 : 0;
 }

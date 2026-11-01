@@ -66,3 +66,69 @@ make -C navi48-native/airnt-plugin TARGET_ARCH=x86_64 \
 # 目标机
 cd /tmp/n48probe && sudo ./TriangleTest      # mismatches: 0
 ```
+
+## 五、2026-11-01 晚：硬件参数路径打通
+
+结论：**"SGPR soffset 编码被这块芯片丢弃"不成立**，硬件参数路径本身一直可用。
+之前失败是两个与寻址无关的原因，外加一种不可靠的验证方式。
+
+### 证据：SADDR 形式是好的
+
+- 已交付的顶点缓冲路径本身就发 `global_store_b128 v1, v[3:6], s[16:17]`（SADDR），
+  且 `mismatches: 0`；
+- 让着色器写完 ring 再**自己读回**，SADDR 与 64 位 VGPR 两种形式都读到了刚写的标记。
+
+CPU 侧通过驱动窗口读 ring 不可靠：ring 内容在 GPU 缓存里，未回写时窗口读到的
+是旧数据（本次实测两次全 0，而着色器自己读回正常）。判断"是否落地"必须用
+着色器内回读，或直接看像素阶段的读取结果。
+
+### 真正的两个根因
+
+1. **`ds_param_load` 的隐式 M0 是 primitive mask**（像素阶段的 `s4`，
+   `ac_shader_args.h` 里 `prim_mask` 位于 user SGPR 之后的固定槽位）。固定
+   `m0 = 0` 时每个 lane 都读到同一条顶点记录，整块三角形呈现单一颜色。
+2. **`ds_param_load` 只取本 lane 的顶点值，不做插值**。Mesa
+   （`aco_lower_to_hw_instr.cpp` 的 `emit_interp_instr_gfx11`）的序列是
+   `ds_param_load` → `v_interp_p10_f32_inreg(p, I, p)` → `v_interp_p2_f32_inreg(p, J, tmp)`，
+   用像素 ABI 里的 I/J 做重心插值。
+
+### ring 写入地址
+
+`ac_nir_store_parameters_to_attr_ring()`：一个参数一个 vec4，
+
+```
+ring_base + ((s5 & 0x7fff) << 9) + param * 512 + (export_thread % 32) * 16
+```
+
+- `s5` 是 `gs_attr_offset`，**不是常数**：实测同一张卡上依次为 `0x0 / 0xB00 /
+  0x1600`，每次 `+0xB00`，即 `+0x160000` 字节——每个 SE 的 attribute ring 就是
+  `0x160000`，它选的是 SE 切片。早先"四个切片每轮丢一个"就是这个偏移在移动。
+- `s8..s11` 是 USER_DATA word 0..3（ring 描述符），实测
+  `0e010000 / c0000080 / 00160000 / 0043ffac`；word 1 高位的 `0xC0000000` 是
+  `SWIZZLE_ENABLE`，当地址用必须 `& 0xffff`。
+- 参数之间是 512 字节（`index_stride * element_size = 32 * 16`），不是 16。
+
+### gfx12 的等待
+
+`gfx12` 把等待拆开：`s_waitcnt`（`0xbf890000`）不含 store 计数，写 ring 之后
+要用 `s_wait_storecnt 0x0`（`0xbfc10000`）保证在 primitive export 前提交。
+
+### 交付行为
+
+- 默认走**硬件参数路径**：顶点阶段写 ring，像素阶段
+  `ds_param_load` + `v_interp`；TriangleTest `mismatches: 0`，连续三次一致。
+- `N48_VB_PARAM=1` 回退到原来的顶点缓冲 + 软件插值路径（同样 `mismatches: 0`）。
+
+### 内联汇编不可用
+
+本管线没有目标汇编解析器：
+
+```
+LLVM ERROR: Inline asm not supported by this streamer because we don't have an asm parser for this target
+```
+
+需要强制 64 位 VGPR 地址形式时，用"发散 load 把基址拉进 VGPR"的办法（基址经一次
+按 lane 取址的 `global_load` 往返，指令选择无法再拆成 SGPR saddr）。
+
+工具：`tools/n48-auto-test/ring-scan.sh`（跑一次 StageProbe → 解析该次 ring 基址
+→ 按该基址扫描）。

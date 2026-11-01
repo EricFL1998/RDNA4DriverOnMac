@@ -7,9 +7,19 @@
 #include <llvm/IR/IntrinsicsAMDGPU.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
+#include <cstdlib>
 
 namespace air2gfx12 {
 namespace {
+
+// The fragment stage normally reads varyings from the hardware parameter path
+// (the vertex stage writes them to the attribute ring, the pixel stage reads
+// them with lds.param.load + v_interp). N48_VB_PARAM=1 selects the older
+// vertex-buffer fallback, where the pixel stage interpolates them in software.
+bool hardwareParamEnabled() {
+    const char* value = std::getenv("N48_VB_PARAM");
+    return !(value && *value && *value != '0');
+}
 
 std::string stringOperand(llvm::MDNode* node, unsigned index) {
     if (!node || index >= node->getNumOperands()) return "";
@@ -353,22 +363,31 @@ llvm::Function* lowerVertex(llvm::Function& original, llvm::MDNode* description,
     llvm::Value* threadIndex = builder.CreateAdd(builder.CreateShl(waveIndex, 5), builder.CreateAnd(lane, builder.getInt32(31)));
     auto* vec4 = llvm::FixedVectorType::get(floatType, 4);
     // ac_nir_store_parameters_to_attr_ring(): one vec4 per parameter, written at
-    // ring_base + gs_attr_offset + export_thread * 16 + param * 16, where the
-    // export thread is wave_index * 32 + lane. The gs_attr_offset term is what
-    // selects this subgroup's slot inside the ring; leaving it out pointed every
-    // store at the first slot, so the pixel shader's ds_param_load (which reads
-    // the slot SPI handed the primitive) saw nothing and the triangle came out
-    // black while the ring itself looked populated.
-    // The parameter goes into the vertex buffer (which the shader can write -
-    // verified on hardware) rather than the attribute ring. Stores into the
-    // ring never reached memory: a constant address inside the same allocation
-    // did land, so the ring's own write path is what fails, not the data or the
-    // address. The fragment stage reads these slots back and interpolates in
-    // software; see lowerFragment.
-    llvm::Value* vbBase = builder.CreateIntToPtr(replacement->getArg(11),
-        llvm::PointerType::get(original.getContext(), 1));
-    llvm::Value* slot = builder.CreateSExt(
-        builder.CreateMul(threadIndex, builder.getInt32(16)), builder.getInt64Ty());
+    // ring_base + gs_attr_offset + export_thread * 16 + param * 512. gs_attr_offset
+    // is not constant: it is the GE's per-SE ring slice (0, 0xB00, 0x1600, ...
+    // times 512 bytes), so it has to come from the wave's SGPR - folding it in at
+    // compile time only ever hit one slice.
+    // The fallback (N48_VB_PARAM=1) writes the same vec4 into the vertex buffer
+    // instead, where the pixel stage interpolates it in software; see
+    // lowerFragment.
+    const bool hardwareParam = hardwareParamEnabled();
+    llvm::Value* ringAddress = nullptr;
+    if (hardwareParam) {
+        // The ring base is USER_DATA word 0 (s8:s9); word 1's top bits carry
+        // SWIZZLE_ENABLE, not address, so they are masked off before use.
+        llvm::Value* ringLo = builder.CreateExtractElement(replacement->getArg(6), uint64_t(0));
+        llvm::Value* ringHi = builder.CreateAnd(
+            builder.CreateExtractElement(replacement->getArg(6), uint64_t(1)), builder.getInt32(0xFFFF));
+        llvm::Value* ringBase = builder.CreateOr(
+            builder.CreateZExt(ringLo, builder.getInt64Ty()),
+            builder.CreateShl(builder.CreateZExt(ringHi, builder.getInt64Ty()), builder.getInt64(32)));
+        llvm::Value* attrOffset = builder.CreateShl(
+            builder.CreateAnd(replacement->getArg(3), builder.getInt32(0x7FFF)), 9);
+        llvm::Value* laneOffset = builder.CreateAdd(attrOffset,
+            builder.CreateMul(threadIndex, builder.getInt32(16)));
+        ringAddress = builder.CreateAdd(ringBase,
+            builder.CreateZExt(laneOffset, builder.getInt64Ty()));
+    }
     unsigned parameter = 0;
     for (unsigned i = 0; i < outputs->getNumOperands(); ++i) {
         auto* output = llvm::dyn_cast_or_null<llvm::MDNode>(outputs->getOperand(i));
@@ -385,15 +404,39 @@ llvm::Function* lowerVertex(llvm::Function& original, llvm::MDNode* description,
                                   builder.CreateExtractElement(value, component);
             vector = builder.CreateInsertElement(vector, scalar, component);
         }
-        llvm::Value* address = builder.CreateGEP(llvm::Type::getInt8Ty(original.getContext()),
-            vbBase, builder.CreateAdd(slot, builder.getInt64(0x40ull + uint64_t(parameter++) * 0x100ull)));
-        builder.CreateAlignedStore(vector, address, llvm::Align(16));
+        if (hardwareParam) {
+            // One vec4 per parameter. The slot for this lane's vertex is already
+            // folded into ringAddress; later parameters sit one 512-byte
+            // (index_stride * element_size) record apart.
+            llvm::Value* target = builder.CreateAdd(ringAddress,
+                builder.getInt64(uint64_t(parameter) * 512ull));
+            builder.CreateAlignedStore(vector,
+                builder.CreateIntToPtr(target, llvm::PointerType::get(original.getContext(), 1)),
+                llvm::Align(16));
+        } else {
+            // One 256-byte slot per parameter, one 16-byte record per vertex.
+            llvm::Value* vbBase = builder.CreateIntToPtr(replacement->getArg(11),
+                llvm::PointerType::get(original.getContext(), 1));
+            llvm::Value* slot = builder.CreateSExt(
+                builder.CreateMul(threadIndex, builder.getInt32(16)), builder.getInt64Ty());
+            llvm::Value* address = builder.CreateGEP(llvm::Type::getInt8Ty(original.getContext()),
+                vbBase, builder.CreateAdd(slot, builder.getInt64(0x40ull + uint64_t(parameter) * 0x100ull)));
+            builder.CreateAlignedStore(vector, address, llvm::Align(16));
+        }
+        ++parameter;
     }
     builder.CreateBr(afterAttributes);
 
     builder.SetInsertPoint(afterAttributes);
-    // Ensure all attribute ring stores are committed to device memory before primitive export!
+    // gfx12 splits the wait counters: s_waitcnt covers loads, DMA and LDS but
+    // not stores, so the attribute-ring stores need their own storecnt wait to
+    // be committed before the primitive export hands the primitive to the SPI.
     builder.CreateCall(waitcnt, {builder.getInt32(0)});
+    if (hardwareParam) {
+        llvm::Function* waitStore = llvm::Intrinsic::getOrInsertDeclaration(
+            original.getParent(), llvm::Intrinsic::amdgcn_s_wait_storecnt);
+        builder.CreateCall(waitStore, {builder.getInt16(0)});
+    }
 
     // Primitive export: lane 0 exports the connectivity as the FINAL export marked done=true
     builder.CreateCondBr(builder.CreateICmpULT(lane, builder.getInt32(1)), primitive, done);
@@ -465,6 +508,36 @@ llvm::Function* lowerFragment(llvm::Function& original, llvm::MDNode* descriptio
         llvm::Value* base = builder.CreateAdd(vbAddress,
             builder.getInt64(0x40ull + uint64_t(attributeIndex) * 0x100ull));
         llvm::Value* value = llvm::PoisonValue::get(argument->getType());
+        if (hardwareParamEnabled()) {
+            // Same sequence as aco's emit_interp_instr_gfx11:
+            //   p   = lds.param.load(chan, attr, m0)   -- this lane's vertex
+            //   p10 = v_interp_p10_f32_inreg(p, I, p)
+            //   out = v_interp_p2_f32_inreg(p, J, p10)
+            // M0 is the primitive mask (s4), which selects the vertex each lane
+            // contributes; the two v_interp steps then blend the quad with the
+            // barycentrics the PS ABI delivers.
+            llvm::Function* paramLoad = llvm::Intrinsic::getOrInsertDeclaration(
+                original.getParent(), llvm::Intrinsic::amdgcn_lds_param_load);
+            llvm::Function* interpP10 = llvm::Intrinsic::getOrInsertDeclaration(
+                original.getParent(), llvm::Intrinsic::amdgcn_interp_inreg_p10);
+            llvm::Function* interpP2 = llvm::Intrinsic::getOrInsertDeclaration(
+                original.getParent(), llvm::Intrinsic::amdgcn_interp_inreg_p2);
+            llvm::Value* maskOperand = primitiveMask;
+            if (const char* maskText = std::getenv("N48_HW_M0"))
+                maskOperand = builder.getInt32(uint32_t(std::strtoul(maskText, nullptr, 0)));
+            for (unsigned component = 0; component < components; ++component) {
+                llvm::Value* p = builder.CreateCall(paramLoad,
+                    {builder.getInt32(component), builder.getInt32(attributeIndex), maskOperand});
+                llvm::Value* p10 = builder.CreateCall(interpP10, {p, i, p});
+                llvm::Value* interpolated = builder.CreateCall(interpP2, {p, j, p10});
+                value = argument->getType()->isVectorTy()
+                    ? builder.CreateInsertElement(value, interpolated, component)
+                    : interpolated;
+            }
+            ++attributeIndex;
+            argument->replaceAllUsesWith(value);
+            continue;
+        }
         for (unsigned component = 0; component < components; ++component) {
             // The primitive the rasterizer hands us is rotated by one against
             // the vertex indices: weight 0 lands on the second vertex, I on the
