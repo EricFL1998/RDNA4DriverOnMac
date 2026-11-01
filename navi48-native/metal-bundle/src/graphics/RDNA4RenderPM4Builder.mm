@@ -107,6 +107,22 @@ uint32_t diPrimTypeFor(MTLPrimitiveType type) {
     if (!_builder.setPixelShader(gpuAddress, rsrc1, rsrc2)) _reject(__func__);
 }
 
+- (void)setVertexUserData:(uint32_t)userSgpr value:(uint64_t)value {
+    // SPI_SHADER_USER_DATA_GS_0 is s8 on gfx12; the binding table stores the
+    // absolute SGPR index.
+    if (userSgpr < 8) { _reject(__func__); return; }
+    NSLog(@"RDNA4RenderPM4Builder: GS userdata s%u = 0x%llx", userSgpr, value);
+    if (!_builder.setShaderUserData(GFX12::SPI_SHADER_USER_DATA_GS_0, userSgpr - 8, value)) {
+        _reject(__func__);
+    }
+}
+
+- (void)setFragmentUserData:(uint32_t)userSgpr value:(uint64_t)value {
+    if (!_builder.setShaderUserData(GFX12::SPI_SHADER_USER_DATA_PS_0, userSgpr, value)) {
+        _reject(__func__);
+    }
+}
+
 - (void)setVertexBuffer:(NSUInteger)index address:(uint64_t)addr stride:(uint32_t)stride count:(uint32_t)count {
     if (index != 0 || !_builder.setVertexInputs(addr, stride, _attributeRingAddress,
                                                 _attributeRingSize, _parameterCount,
@@ -119,8 +135,12 @@ uint32_t diPrimTypeFor(MTLPrimitiveType type) {
 
 - (void)setColorBuffer:(NSUInteger)index texture:(RDNA4Texture*)texture {
     if (!texture) return;
+    // CB_COLOR0_ATTRIB2.MIP0_WIDTH carries the surface pitch in texels for a
+    // linear target, not the visible width. It has to match the padded pitch
+    // the texture allocates, otherwise the CB walks rows at the wrong stride.
+    const NSUInteger pitch = [texture pitchTexelsForLevel:0];
     if (!_builder.setColorAttachment((uint32_t)index, [texture gpuAddress],
-                                     (uint32_t)[texture width], (uint32_t)[texture height],
+                                     (uint32_t)pitch, (uint32_t)[texture height],
                                      cbFormatFor([texture pixelFormat]),
                                      (uint32_t)[texture sampleCount],
                                      // The fragment shader exports R,G,B,A; the

@@ -42,4 +42,9 @@
  */
 - (RDNA4CompiledShader*)compiledShader;
 
+/**
+ * Resource binding table of this shader (internal use).
+ */
+- (NSData*)bindings;
+
 @end

@@ -5,13 +5,13 @@ LLVM_CXXFLAGS := $(shell $(LLVM_CONFIG) --cxxflags)
 LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags)
 LLVM_LIBS     := $(shell $(LLVM_CONFIG) --system-libs --libs core bitreader bitwriter linker ipo irreader transformutils target mc passes amdgpu asmparser all-targets)
 
-CXXFLAGS := -std=c++17 -Wall -Wextra -Wno-unused-parameter -Isrc $(LLVM_CXXFLAGS)
+CXXFLAGS := -std=c++17 -Wall -Wextra -Wno-unused-parameter -Isrc $(LLVM_CXXFLAGS) -MMD -MP
 LDFLAGS  := $(LLVM_LDFLAGS) $(LLVM_LIBS)
 
 BIN_DIR := bin
 OBJ_DIR := obj
 
-SRCS := src/main.cpp src/MTLBUnpacker.cpp src/AIRLinker.cpp src/AIRGraphicsLowering.cpp src/GFX12Emitter.cpp src/ShaderMetadata.cpp src/PM4Builder.cpp
+SRCS := src/main.cpp src/MTLBUnpacker.cpp src/AIRLinker.cpp src/AIRGraphicsLowering.cpp src/AIRBuiltins.cpp src/GFX12Emitter.cpp src/ShaderMetadata.cpp src/PM4Builder.cpp
 OBJS := $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
 TARGET := $(BIN_DIR)/air2gfx12
 
@@ -24,7 +24,7 @@ TEST_GRAPHICS := $(BIN_DIR)/test_graphics_lowering
 
 TEST_BINARIES := $(TEST_UNPACKER) $(TEST_LINKER) $(TEST_EMITTER) $(TEST_METADATA) $(TEST_PM4) $(TEST_GRAPHICS)
 
-.PHONY: all clean test build_tests test_unpacker test_linker test_emitter test_metadata test_pm4 test_golden verify_phase1
+.PHONY: all clean test build_tests test_unpacker test_linker test_emitter test_metadata test_pm4 test_golden test_system_shaders verify_phase1
 
 all: $(TARGET)
 
@@ -48,8 +48,8 @@ $(TEST_UNPACKER): $(OBJ_DIR)/MTLBUnpacker.o tests/test_unpacker.cpp | $(BIN_DIR)
 test_linker: $(TEST_LINKER)
 	./$(TEST_LINKER)
 
-$(TEST_LINKER): $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/MTLBUnpacker.o tests/test_linker.cpp | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) tests/test_linker.cpp $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/MTLBUnpacker.o $(LDFLAGS) -o $@
+$(TEST_LINKER): $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/AIRBuiltins.o $(OBJ_DIR)/MTLBUnpacker.o tests/test_linker.cpp | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) tests/test_linker.cpp $(OBJ_DIR)/AIRLinker.o $(OBJ_DIR)/AIRGraphicsLowering.o $(OBJ_DIR)/AIRBuiltins.o $(OBJ_DIR)/MTLBUnpacker.o $(LDFLAGS) -o $@
 
 test_emitter: $(TEST_EMITTER)
 	./$(TEST_EMITTER)
@@ -72,6 +72,9 @@ $(TEST_PM4): $(OBJ_DIR)/PM4Builder.o tests/test_pm4.cpp | $(BIN_DIR)
 test_golden: all
 	bash tests/batch_golden_test.sh
 
+test_system_shaders: all
+	bash tests/system_shaders_test.sh
+
 test_graphics: $(TEST_GRAPHICS)
 	./$(TEST_GRAPHICS)
 
@@ -87,3 +90,5 @@ clean:
 test: all test_unpacker test_linker test_emitter test_metadata test_pm4 test_graphics test_golden
 	bash tests/test_cli.sh
 	bash tests/e2e_test.sh
+
+-include $(OBJS:.o=.d)

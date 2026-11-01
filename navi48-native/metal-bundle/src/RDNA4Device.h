@@ -28,6 +28,10 @@
 
 // Buffer creation
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options;
+
+// One NGG ring shared by every pipeline on this device. Allocating it per
+// pipeline consumes 10.5 MiB of the 32 MiB client window each time.
+- (uint64_t)sharedNGGRingAddress:(uint32_t*)outSize;
 - (id<MTLBuffer>)newBufferWithBytes:(const void*)pointer length:(NSUInteger)length options:(MTLResourceOptions)options;
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void*)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void* pointer, NSUInteger length))deallocator;
 

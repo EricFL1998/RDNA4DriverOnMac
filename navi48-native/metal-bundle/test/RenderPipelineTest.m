@@ -27,7 +27,7 @@ static int checkShader(id pipeline, NSString *stage) {
     }
     NSNumber *rsrc1 = [shader valueForKey:@"pgmRsrc1"];
     NSNumber *rsrc2 = [shader valueForKey:@"pgmRsrc2"];
-    unsigned expectedRsrc2 = [stage isEqualToString:@"vertex"] ? 0x14u : 0u;
+    unsigned expectedRsrc2 = [stage isEqualToString:@"vertex"] ? 0x16u : 0u;
     if (rsrc1.unsignedIntValue == 0 || rsrc2.unsignedIntValue != expectedRsrc2) {
         return fail([NSString stringWithFormat:@"%@ graphics resource metadata is invalid", stage]);
     }

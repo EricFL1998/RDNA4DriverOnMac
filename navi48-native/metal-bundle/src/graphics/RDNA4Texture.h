@@ -47,9 +47,31 @@
 - (uint64_t)gpuAddress;
 
 /**
+ * Get the GPU address of this texture's GFX12 T# descriptor (internal use).
+ */
+- (uint64_t)descriptorAddress;
+
+/**
+ * Mark this texture as written by the GPU. The next CPU readback copies the
+ * GPU-side staging buffer back into the IOSurface.
+ */
+- (void)markGPURendered;
+
+/**
+ * Copy the IOSurface's CPU contents into the GPU-side staging buffer.
+ */
+- (void)synchronizeFromIOSurface;
+
+/**
  * Get bytes per row for a given mipmap level
  */
 - (NSUInteger)bytesPerRowForLevel:(NSUInteger)level;
+
+/**
+ * Get the row pitch in texels for a given mipmap level. Linear surfaces are
+ * padded to a 128-byte pitch, so this can exceed the mip's visible width.
+ */
+- (NSUInteger)pitchTexelsForLevel:(NSUInteger)level;
 
 /**
  * Get bytes per image for a given mipmap level

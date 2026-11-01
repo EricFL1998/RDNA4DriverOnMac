@@ -52,6 +52,16 @@
 @end
 
 /**
+ * Resource binding layout produced by the AIRNT compiler.
+ */
+typedef struct {
+    uint32_t userSgpr;        // absolute SGPR index of the 64-bit descriptor address
+    uint32_t locationIndex;   // Metal binding index
+    uint32_t kind;            // 0 texture, 1 sampler, 2 buffer
+    uint32_t addressSpace;
+} RDNA4Binding;
+
+/**
  * Internal structure to cache compiled shaders
  */
 @interface RDNA4CompiledShader : NSObject
@@ -75,5 +85,6 @@
 @property (nonatomic, assign) uint32_t pgmRsrc1;
 @property (nonatomic, assign) uint32_t pgmRsrc2;
 @property (nonatomic, assign) uint32_t vertexParameterCount;
+@property (nonatomic, strong) NSData* bindings;
 
 @end

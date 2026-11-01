@@ -49,6 +49,10 @@
     return _compiledShader;
 }
 
+- (NSData*)bindings {
+    return _compiledShader.bindings;
+}
+
 // MTLFunction optional methods
 - (MTLFunctionOptions)options {
     return 0;

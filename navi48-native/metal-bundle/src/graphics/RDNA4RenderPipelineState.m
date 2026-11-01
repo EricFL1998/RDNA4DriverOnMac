@@ -11,6 +11,8 @@
     RDNA4Device* _device;
     RDNA4CompiledShader* _vertexShader;
     RDNA4CompiledShader* _fragmentShader;
+    NSData* _vertexBindings;
+    NSData* _fragmentBindings;
     RDNA4Buffer* _vertexShaderBuffer;
     RDNA4Buffer* _fragmentShaderBuffer;
     RDNA4Buffer* _attributeRingBuffer;
@@ -52,8 +54,10 @@
         RDNA4Function* fragmentFunc = (RDNA4Function*)descriptor.fragmentFunction;
         
         _vertexShader = [vertexFunc compiledShader];
+        _vertexBindings = _vertexShader.bindings;
         if (fragmentFunc) {
             _fragmentShader = [fragmentFunc compiledShader];
+            _fragmentBindings = _fragmentShader.bindings;
         }
         
         if (!_vertexShader || !_vertexShader.machineCode) {
@@ -70,27 +74,17 @@
             return nil;
         }
         if (_vertexShader.vertexParameterCount > 0) {
-            // The NGG rings must live in memory the client's VMID maps: the
-            // vertex stage writes its parameter exports into them with ordinary
-            // global stores, and a driver-owned VRAM buffer is not mapped there
-            // (the stores are dropped silently while the GE's own ring writes
-            // still land). So the rings are carved out of the client window -
-            // 0x580000 of attribute ring (0x160000 per SE), then the position and
-            // primitive rings - and N48_RING_IN_DRIVER_VRAM opts back out.
-            RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+            // One NGG ring per device, shared by every pipeline. Allocating it
+            // per pipeline would consume 10.5 MiB of the 32 MiB client window
+            // and exhaust it after three pipelines.
             uint32_t ringSize = 0;
             uint64_t ringBase = 0;
-            if (!getenv("N48_RING_IN_DRIVER_VRAM") && link) {
-                uint64_t raw = RDNA4GpuAllocate(link, 0xA80000u + 0x10000u);
-                if (raw) {
-                    ringBase = (raw + 0xFFFFu) & ~0xFFFFull;   // the GE needs a 64 KiB-aligned base
-                    void* ring = RDNA4GpuPointerForAddress(link, ringBase);
-                    if (ring) memset(ring, 0, 0xA80000u);
-                    ringSize = 0xA80000u;
-                }
+            RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+            if (!getenv("N48_RING_IN_DRIVER_VRAM")) {
+                ringBase = [(RDNA4Device*)_device sharedNGGRingAddress:&ringSize];
             }
-            if (!ringBase) {
-                ringBase = link ? RDNA4GpuNggRing(link, &ringSize) : 0;
+            if (!ringBase && link) {
+                ringBase = RDNA4GpuNggRing(link, &ringSize);
             }
             if (!ringBase) {
                 if (error) {
@@ -173,6 +167,14 @@
 
 - (uint64_t)fragmentShaderGPUAddress {
     return _fragmentShaderGPUAddress;
+}
+
+- (NSData*)vertexBindings {
+    return _vertexBindings;
+}
+
+- (NSData*)fragmentBindings {
+    return _fragmentBindings;
 }
 
 - (RDNA4CompiledShader*)vertexShader {

@@ -451,10 +451,18 @@ bool GraphicsPM4Builder::setPixelShader(uint64_t gpuAddr, uint32_t rsrc1,
     // pixel waves. It is not part of the PGM_LO..RSRC2 run, so it is its own
     // packet.
     if (!setReg(GFX12::SPI_SHADER_PGM_RSRC3_PS, GFX12::CU_EN_PS_ALL)) return false;
-    // USER_SGPR=4. LLVM's fragment-stage convention places the first inreg
-    // argument at s2, so words 2..3 are where the lowering reads the vertex
-    // buffer address it interpolates the varyings from.
-    rsrc2 = (rsrc2 & ~0x3Eu) | (4u << 1);
+    // The fragment stage always needs user data words 2..3: LLVM's fragment
+    // convention places the first inreg argument at s2, and the lowering reads
+    // the vertex buffer address it interpolates the varyings from there. A
+    // shader with texture/sampler/buffer resources needs more: the plugin
+    // computes USER_SGPR_COUNT from the binding table (resources start at s5),
+    // and hard-coding 4 here silently starved those shaders - the hardware never
+    // loaded s5:s6, so the descriptor pointer was stale and the scalar load
+    // faulted. Keep the requested count and only raise it to the minimum.
+    const uint32_t requestedUserSgprs = rsrc2 & 0x3Eu;
+    const uint32_t minimumUserSgprs = 4u << 1;
+    rsrc2 = (rsrc2 & ~0x3Eu) |
+            (requestedUserSgprs > minimumUserSgprs ? requestedUserSgprs : minimumUserSgprs);
     const uint32_t program[4] = { lo, hi, rsrc1, rsrc2 };
     return setRegSeq(GFX12::SPI_SHADER_PGM_LO_PS, program, 4);
 }
@@ -512,8 +520,11 @@ namespace {
 // (xlat12_ib.c: xlat12_ib_m2tri_profile).
 constexpr uint32_t kZero4[4] = { 0u, 0u, 0u, 0u };
 
-// The scissor pairs are inclusive on gfx12; 0xFFFFFFFF is "everything".
-constexpr uint32_t kScissorFull = 0xFFFFFFFFu;
+// The scissor pairs are inclusive on gfx12 and their coordinates are 16-bit
+// signed. 0xFFFFFFFF would therefore read as (-1,-1) - an empty rectangle that
+// clips every fragment - while 0x3FFF3FFF (16383,16383) is the largest valid
+// coordinate and covers any surface.
+constexpr uint32_t kScissorFull = 0x3FFF3FFFu;
 
 struct PreambleReg {
     uint32_t addr;
@@ -533,6 +544,11 @@ constexpr PreambleReg kPreamble[] = {
     { GFX12::PA_SC_SCREEN_SCISSOR_TL,  0x00000000u },
     { GFX12::PA_SC_SCREEN_SCISSOR_BR,  kScissorFull },
     { GFX12::PA_SC_WINDOW_SCISSOR_TL,  0x00000000u },
+    // The window scissor gates every fragment independently of the viewport
+    // scissor, and its reset value clips to (0,0). Leaving it uninitialised
+    // drops all fragments for any app that never calls setScissorRect, which is
+    // the common case for a full-target draw.
+    { GFX12::PA_SC_WINDOW_SCISSOR_BR,  kScissorFull },
     { GFX12::PA_SC_GENERIC_SCISSOR_TL, 0x00000000u },
     { GFX12::PA_SC_GENERIC_SCISSOR_BR, kScissorFull },
     // PA_SC_MODE_CNTL_0.VPORT_SCISSOR_ENABLE gates fragments through the viewport

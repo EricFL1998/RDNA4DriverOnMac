@@ -28,6 +28,8 @@
    attributeRingAddress:(uint64_t)attributeRingAddress
      attributeRingSize:(uint32_t)attributeRingSize;
 - (void)setFragmentShader:(uint64_t)gpuAddress rsrc1:(uint32_t)rsrc1 rsrc2:(uint32_t)rsrc2;
+- (void)setVertexUserData:(uint32_t)userSgpr value:(uint64_t)value;
+- (void)setFragmentUserData:(uint32_t)userSgpr value:(uint64_t)value;
 - (void)setVertexBuffer:(NSUInteger)index address:(uint64_t)addr stride:(uint32_t)stride count:(uint32_t)count;
 - (void)setDrawCounts:(uint32_t)vertexCount primitives:(uint32_t)primitiveCount;
 - (void)setColorBuffer:(NSUInteger)index texture:(RDNA4Texture*)texture;

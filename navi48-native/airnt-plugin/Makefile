@@ -14,6 +14,7 @@ AIR2GFX12_SRC := ../../tools/air2gfx12/src
 AIR2GFX12_OBJS := $(AIR2GFX12_SRC)/MTLBUnpacker.o \
                   $(AIR2GFX12_SRC)/AIRLinker.o \
                   $(AIR2GFX12_SRC)/AIRGraphicsLowering.o \
+                  $(AIR2GFX12_SRC)/AIRBuiltins.o \
                   $(AIR2GFX12_SRC)/GFX12Emitter.o \
                   $(AIR2GFX12_SRC)/ShaderMetadata.o
 
@@ -35,14 +36,14 @@ $(PLUGIN_OBJ): $(PLUGIN_SRC)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Build air2gfx12 objects if not already built
-$(AIR2GFX12_OBJS): %.o: %.cpp
+$(AIR2GFX12_OBJS): %.o: %.cpp $(wildcard $(AIR2GFX12_SRC)/*.hpp)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) $(TARGET) | bin
-	$(CXX) $(CXXFLAGS) $(TEST_SRC) -L. -lAMDNTPlugin -o $@
+	$(CXX) $(CXXFLAGS) $(TEST_SRC) -L. -lAMDNTPlugin $(LLVM_LDFLAGS) $(LLVM_LIBS) -arch $(TARGET_ARCH) -o $@
 
 bin:
 	mkdir -p bin

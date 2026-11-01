@@ -10,6 +10,16 @@
 
 namespace air2gfx12 {
 
+// One Metal resource binding as the generated shader expects it: the descriptor
+// address goes into userSgpr (low 32 bits) and userSgpr+1 (high 32 bits).
+struct ShaderBinding {
+    uint32_t userSgpr = 0;
+    uint32_t locationIndex = 0;
+    uint32_t kind = 0;          // 0 texture, 1 sampler, 2 buffer
+    uint32_t addressSpace = 0;
+    std::string name;
+};
+
 class AIRLinker {
 public:
     explicit AIRLinker(llvm::LLVMContext& context);
@@ -26,10 +36,14 @@ public:
                                               ShaderStage stage,
                                               std::string* outError);
 
+    // Binding table of the last loadAndLink() call (graphics stages only).
+    const std::vector<ShaderBinding>& bindings() const { return mBindings; }
+
 private:
     llvm::LLVMContext& mContext;
     std::unique_ptr<llvm::Module> mRuntimeTemplate;
     std::string mRuntimePath;
+    std::vector<ShaderBinding> mBindings;
 };
 
 } // namespace air2gfx12

@@ -72,6 +72,17 @@ llvm::Function* cloneWithType(llvm::Function& original, llvm::FunctionType* type
     return replacement;
 }
 
+// A paired slot is one of the vertex stage's reserved i32 pairs s12:s13 or
+// s14:s15; the driver writes a 64-bit descriptor address into each pair as
+// low/high words. An unpaired slot is a plain 64-bit inreg argument.
+llvm::Value* resourceAddress(llvm::IRBuilder<>& builder, llvm::Function* function,
+                             unsigned slot, bool paired) {
+    if (!paired) return function->getArg(slot);
+    llvm::Value* low = builder.CreateZExt(function->getArg(slot), builder.getInt64Ty());
+    llvm::Value* high = builder.CreateZExt(function->getArg(slot + 1), builder.getInt64Ty());
+    return builder.CreateOr(low, builder.CreateShl(high, builder.getInt64(32)));
+}
+
 llvm::Function* finishReplacement(llvm::Function& original, llvm::Function& replacement,
                                   llvm::CallingConv::ID convention) {
     replacement.setCallingConv(convention);
@@ -187,12 +198,24 @@ llvm::Function* lowerVertex(llvm::Function& original, llvm::MDNode* description,
         if (outError) *outError = "AIR vertex input layout does not match the function signature";
         return nullptr;
     }
+    bool hasVertexInput = false;
     for (const llvm::MDOperand& operand : inputs->operands()) {
         auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(operand);
-        if (!hasTag(input, "air.vertex_input")) {
+        if (!input) {
             if (outError) *outError = "Unsupported AIR vertex input";
             return nullptr;
         }
+        if (hasTag(input, "air.vertex_input")) {
+            hasVertexInput = true;
+            continue;
+        }
+        if (hasTag(input, "air.arg_unused") || hasTag(input, "air.vertex_id")) continue;
+        if (hasTag(input, "air.buffer") || hasTag(input, "air.texture") ||
+            hasTag(input, "air.sampler")) {
+            continue;
+        }
+        if (outError) *outError = "Unsupported AIR vertex input: " + stringOperand(input, 0);
+        return nullptr;
     }
     auto* outputs = llvm::dyn_cast_or_null<llvm::MDNode>(description->getOperand(1));
     if (!outputs || outputs->getNumOperands() == 0) {
@@ -224,10 +247,34 @@ llvm::Function* lowerVertex(llvm::Function& original, llvm::MDNode* description,
     argumentTypes.push_back(llvm::Type::getInt64Ty(original.getContext()));
     argumentTypes.push_back(intType);
     for (unsigned vgpr = 0; vgpr < 4; ++vgpr) argumentTypes.push_back(intType);
+    // The first two resource pointers use the four reserved i32 slots at
+    // s12..s15 (low/high halves). The driver's 20-dword GS block already
+    // delivers s8..s27, so s12:s13 and s14:s15 are inside the usable bank.
+    // Further resources keep the old appended i64 path (s19+).
+    llvm::SmallVector<unsigned, 16> resourceParameter(original.arg_size(), ~0u);
+    llvm::SmallVector<bool, 16> resourcePaired(original.arg_size(), false);
+    uint32_t resourceOrdinal = 0;
+    for (unsigned index = 0; index < original.arg_size(); ++index) {
+        auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(inputs->getOperand(index));
+        if (!input || hasTag(input, "air.arg_unused")) continue;
+        if (!hasTag(input, "air.buffer") && !hasTag(input, "air.texture") &&
+            !hasTag(input, "air.sampler")) continue;
+        if (resourceOrdinal < 2) {
+            resourceParameter[index] = 7u + 2u * resourceOrdinal;  // s12 or s14
+            resourcePaired[index] = true;
+        } else {
+            resourceParameter[index] = argumentTypes.size();
+            argumentTypes.push_back(llvm::Type::getInt64Ty(original.getContext()));
+        }
+        ++resourceOrdinal;
+    }
     llvm::FunctionType* type = llvm::FunctionType::get(
         llvm::Type::getVoidTy(original.getContext()), argumentTypes, false);
     llvm::Function* replacement = cloneWithType(original, type);
     for (unsigned index = 0; index < 13; ++index) {
+        replacement->addParamAttr(index, llvm::Attribute::InReg);
+    }
+    for (unsigned index = 17; index < argumentTypes.size(); ++index) {
         replacement->addParamAttr(index, llvm::Attribute::InReg);
     }
     llvm::BasicBlock& entry = replacement->getEntryBlock();
@@ -245,49 +292,91 @@ llvm::Function* lowerVertex(llvm::Function& original, llvm::MDNode* description,
         original.getParent(), llvm::Intrinsic::amdgcn_mbcnt_lo);
     llvm::Value* lane = builder.CreateCall(mbcnt, {builder.getInt32(~0u), builder.getInt32(0)});
     llvm::Value* vertexCount = builder.getInt32(3);
+    if (!hasVertexInput) {
+        // Resource arguments and the vertex-id builtin are not vertex-buffer
+        // fetches: the driver hands the shader one 64-bit descriptor address per
+        // resource (consecutive user SGPRs) and the lane index is the vertex id.
+        for (unsigned index = 0; index < original.arg_size(); ++index) {
+            auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(inputs->getOperand(index));
+            llvm::Argument* argument = original.getArg(index);
+            if (!input || hasTag(input, "air.arg_unused")) {
+                argument->replaceAllUsesWith(llvm::PoisonValue::get(argument->getType()));
+                continue;
+            }
+            if (resourceParameter[index] != ~0u) {
+                argument->replaceAllUsesWith(builder.CreateIntToPtr(
+                    resourceAddress(builder, replacement, resourceParameter[index],
+                                    resourcePaired[index]),
+                    argument->getType()));
+                continue;
+            }
+            if (hasTag(input, "air.vertex_id")) {
+                argument->replaceAllUsesWith(lane);
+                continue;
+            }
+        }
+    }
     // Guarantee the 3 vertices are processed:
     builder.CreateCondBr(builder.CreateICmpULT(lane, builder.getInt32(3)), fetch, merge);
 
     builder.SetInsertPoint(fetch);
-    // In GFX12 NGG passthrough mode, the hardware does not pass VertexID in v3.
-    // Each ES lane in the wave corresponds directly to an input vertex:
-    // lane 0 = vertex 0, lane 1 = vertex 1, lane 2 = vertex 2.
-    // Using arg(16) (v3) multiplied stride by uninitialized garbage, reading
-    // wild addresses and collapsing the triangle coordinates to (0, 0).
-    llvm::Value* vertexIndex = lane;
-    llvm::Value* byteOffset = builder.CreateMul(
-        builder.CreateZExt(vertexIndex, builder.getInt64Ty()),
-        builder.CreateZExt(replacement->getArg(12), builder.getInt64Ty()));
-    llvm::Value* buffer = builder.CreateIntToPtr(replacement->getArg(11),
-        llvm::PointerType::get(original.getContext(), 1));
-    uint32_t inputOffset = 0;
-    for (unsigned index = 0; index < original.arg_size(); ++index) {
-        llvm::Argument* argument = original.getArg(index);
-        unsigned components = floatComponents(argument->getType());
-        if (!components) {
-            if (outError) *outError = "Only float vertex inputs are supported";
-            return nullptr;
-        }
-        llvm::Value* value = llvm::PoisonValue::get(argument->getType());
-        for (unsigned component = 0; component < components; ++component) {
-            llvm::Value* address = builder.CreateGEP(builder.getInt8Ty(), buffer,
-                builder.CreateAdd(byteOffset, builder.getInt64(inputOffset + component * 4)));
-            llvm::LoadInst* load = builder.CreateLoad(floatType, address);
-            load->setAlignment(llvm::Align(4));
-            value = argument->getType()->isVectorTy()
-                ? builder.CreateInsertElement(value, load, component)
-                : load;
-        }
-        inputOffset += components * 4;
-        argument->replaceAllUsesWith(value);
-    }
-    // Ensure all memory loads finish completely before continuing to the shader
-    // body and export. Without this wait, s_wait_loadcnt 0x1 only waits for the
-    // 4-byte load, while the 16-byte load containing position coordinates is still
-    // inflight, exporting (0, 0) and collapsing the triangle to a 0-area point.
     llvm::Function* waitcnt = llvm::Intrinsic::getOrInsertDeclaration(
         original.getParent(), llvm::Intrinsic::amdgcn_s_waitcnt);
-    builder.CreateCall(waitcnt, {builder.getInt32(0)});
+    if (hasVertexInput) {
+        // In GFX12 NGG passthrough mode, the hardware does not pass VertexID in v3.
+        // Each ES lane in the wave corresponds directly to an input vertex:
+        // lane 0 = vertex 0, lane 1 = vertex 1, lane 2 = vertex 2.
+        // Using arg(16) (v3) multiplied stride by uninitialized garbage, reading
+        // wild addresses and collapsing the triangle coordinates to (0, 0).
+        llvm::Value* vertexIndex = lane;
+        llvm::Value* byteOffset = builder.CreateMul(
+            builder.CreateZExt(vertexIndex, builder.getInt64Ty()),
+            builder.CreateZExt(replacement->getArg(12), builder.getInt64Ty()));
+        llvm::Value* buffer = builder.CreateIntToPtr(replacement->getArg(11),
+            llvm::PointerType::get(original.getContext(), 1));
+        uint32_t inputOffset = 0;
+        for (unsigned index = 0; index < original.arg_size(); ++index) {
+            auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(inputs->getOperand(index));
+            llvm::Argument* argument = original.getArg(index);
+            if (!input || hasTag(input, "air.arg_unused")) {
+                argument->replaceAllUsesWith(llvm::PoisonValue::get(argument->getType()));
+                continue;
+            }
+            if (resourceParameter[index] != ~0u) {
+                argument->replaceAllUsesWith(builder.CreateIntToPtr(
+                    resourceAddress(builder, replacement, resourceParameter[index],
+                                    resourcePaired[index]),
+                    argument->getType()));
+                continue;
+            }
+            if (hasTag(input, "air.vertex_id")) {
+                argument->replaceAllUsesWith(lane);
+                continue;
+            }
+            unsigned components = floatComponents(argument->getType());
+            if (!components) {
+                if (outError) *outError = "Only float vertex inputs are supported";
+                return nullptr;
+            }
+            llvm::Value* value = llvm::PoisonValue::get(argument->getType());
+            for (unsigned component = 0; component < components; ++component) {
+                llvm::Value* address = builder.CreateGEP(builder.getInt8Ty(), buffer,
+                    builder.CreateAdd(byteOffset, builder.getInt64(inputOffset + component * 4)));
+                llvm::LoadInst* load = builder.CreateLoad(floatType, address);
+                load->setAlignment(llvm::Align(4));
+                value = argument->getType()->isVectorTy()
+                    ? builder.CreateInsertElement(value, load, component)
+                    : load;
+            }
+            inputOffset += components * 4;
+            argument->replaceAllUsesWith(value);
+        }
+        // Ensure all memory loads finish completely before continuing to the shader
+        // body and export. Without this wait, s_wait_loadcnt 0x1 only waits for the
+        // 4-byte load, while the 16-byte load containing position coordinates is still
+        // inflight, exporting (0, 0) and collapsing the triangle to a 0-area point.
+        builder.CreateCall(waitcnt, {builder.getInt32(0)});
+    }
     builder.CreateBr(&entry);
 
     builder.SetInsertPoint(merge);
@@ -463,12 +552,29 @@ llvm::Function* lowerFragment(llvm::Function& original, llvm::MDNode* descriptio
     llvm::LLVMContext& context = original.getContext();
     llvm::Type* floatType = llvm::Type::getFloatTy(context);
     llvm::Type* ijType = llvm::FixedVectorType::get(floatType, 2);
+    // Resource arguments (texture, sampler, buffer) keep the AIR declaration
+    // order and become one 64-bit address each. The driver writes them into
+    // consecutive user SGPRs after the primitive mask; the shader only ever
+    // dereferences them through the builtin lowering below.
+    llvm::SmallVector<llvm::Type*, 16> parameterTypes = {
+        llvm::Type::getInt32Ty(context), llvm::Type::getInt32Ty(context),
+        llvm::Type::getInt32Ty(context), ijType};
+    llvm::SmallVector<unsigned, 16> resourceParameter(original.arg_size(), ~0u);
+    for (unsigned index = 0; index < original.arg_size(); ++index) {
+        auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(inputs->getOperand(index));
+        if (!input || hasTag(input, "air.arg_unused")) continue;
+        const bool resource = hasTag(input, "air.texture") || hasTag(input, "air.sampler") ||
+                              hasTag(input, "air.buffer");
+        if (!resource) continue;
+        resourceParameter[index] = parameterTypes.size();
+        parameterTypes.push_back(llvm::Type::getInt64Ty(context));
+    }
     llvm::FunctionType* type = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context),
-        {llvm::Type::getInt32Ty(context), llvm::Type::getInt32Ty(context),
-         llvm::Type::getInt32Ty(context), ijType}, false);
+        llvm::Type::getVoidTy(context), parameterTypes, false);
     llvm::Function* replacement = cloneWithType(original, type);
     for (unsigned index = 0; index < 3; ++index)
+        replacement->addParamAttr(index, llvm::Attribute::InReg);
+    for (unsigned index = 4; index < parameterTypes.size(); ++index)
         replacement->addParamAttr(index, llvm::Attribute::InReg);
     llvm::IRBuilder<> builder(&*replacement->getEntryBlock().getFirstInsertionPt());
 
@@ -487,8 +593,30 @@ llvm::Function* lowerFragment(llvm::Function& original, llvm::MDNode* descriptio
     for (unsigned index = 0; index < original.arg_size(); ++index) {
         auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(inputs->getOperand(index));
         llvm::Argument* argument = original.getArg(index);
-        if (hasTag(input, "air.position") && hasTag(input, "air.arg_unused")) {
+        if (hasTag(input, "air.arg_unused")) {
             argument->replaceAllUsesWith(llvm::PoisonValue::get(argument->getType()));
+            continue;
+        }
+        if (resourceParameter[index] != ~0u) {
+            argument->replaceAllUsesWith(builder.CreateIntToPtr(
+                resourceAddress(builder, replacement, resourceParameter[index], false),
+                argument->getType()));
+            continue;
+        }
+        if (hasTag(input, "air.render_target")) {
+            // Framebuffer fetch ([[color(n)]]) needs the fragment position and a
+            // descriptor for the colour attachment; the current PS ABI delivers
+            // neither. Zero keeps the shader compilable and is exact for an
+            // opaque destination; transparent in-place effects degrade until
+            // the fetch ABI lands.
+            argument->replaceAllUsesWith(llvm::Constant::getNullValue(argument->getType()));
+            continue;
+        }
+        if (hasTag(input, "air.position")) {
+            // The PS ABI does not deliver VPOS yet; zero keeps position-dependent
+            // effects (blur/shadow) compilable. Replace with the real fragment
+            // position once SPI_PS_INPUT_CNTL carries VPOS.
+            argument->replaceAllUsesWith(llvm::Constant::getNullValue(argument->getType()));
             continue;
         }
         if (!hasTag(input, "air.fragment_input") || !hasTag(input, "air.center") ||

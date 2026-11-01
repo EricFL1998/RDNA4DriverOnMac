@@ -5,6 +5,8 @@
 #import "RDNA4Texture.h"
 #import "RDNA4RenderPassDescriptor.h"
 #import "RDNA4Device.h"
+#import "RDNA4SamplerState.h"
+#import "RDNA4Library.h"
 
 #import "RDNA4RenderPM4Builder.h"
 
@@ -100,6 +102,8 @@
             [_renderPassDescriptor.colorAttachments objectAtIndexedSubscript:i];
         if (!attachment.texture) continue;
         RDNA4Texture* texture = (RDNA4Texture*)attachment.texture;
+        [texture synchronizeFromIOSurface];
+        [texture markGPURendered];
         [_pm4Builder setColorBuffer:i texture:texture];
         if (attachment.loadAction == MTLLoadActionClear) {
             if (texture.pixelFormat != MTLPixelFormatBGRA8Unorm) {
@@ -181,10 +185,42 @@
                                                         userInfo:@{NSLocalizedDescriptionKey: message}]];
 }
 
+- (const RDNA4Binding*)bindingIn:(NSData*)table
+                            kind:(uint32_t)kind
+                        location:(NSUInteger)location {
+    if (!table || table.length < sizeof(RDNA4Binding)) return NULL;
+    const RDNA4Binding* bindings = (const RDNA4Binding*)table.bytes;
+    NSUInteger count = table.length / sizeof(RDNA4Binding);
+    for (NSUInteger i = 0; i < count; ++i) {
+        if (bindings[i].kind == kind && bindings[i].locationIndex == location) {
+            return &bindings[i];
+        }
+    }
+    return NULL;
+}
+
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
                  offset:(NSUInteger)offset
                 atIndex:(NSUInteger)index {
     if (!buffer) return;
+
+    // A shader buffer at location 0 is usually the same Metal buffer that also
+    // feeds vertex fetch, so index 0 does both: program the fetch descriptor
+    // and write the shader's 64-bit pointer. Other indices are resource-only.
+    const RDNA4Binding* binding = [self bindingIn:_currentPipelineState.vertexBindings
+                                             kind:2 location:index];
+    if (index != 0 && binding) {
+        if (![buffer isKindOfClass:[RDNA4Buffer class]]) {
+            [self failEncoding:@"Buffer is not an RDNA4Buffer"];
+            return;
+        }
+        RDNA4Buffer* rdnaBuffer = (RDNA4Buffer*)buffer;
+        _vertexBuffers[index] = buffer;
+        _vertexBufferOffsets[index] = offset;
+        [_pm4Builder setVertexUserData:binding->userSgpr value:rdnaBuffer.gpuAddress + offset];
+        return;
+    }
+
     if (index != 0 || offset > buffer.length || !_currentPipelineState.vertexDescriptor) {
         [self failEncoding:@"Only an explicit single packed vertex buffer is supported"];
         return;
@@ -223,6 +259,9 @@
     uint64_t gpuAddr = rdnaBuffer.gpuAddress + offset;
     uint32_t count = (uint32_t)((buffer.length - offset) / expectedOffset);
     [_pm4Builder setVertexBuffer:index address:gpuAddr stride:(uint32_t)expectedOffset count:count];
+    if (binding) {
+        [_pm4Builder setVertexUserData:binding->userSgpr value:gpuAddr];
+    }
 }
 
 - (void)setVertexBuffers:(const id<MTLBuffer>*)buffers
@@ -245,8 +284,13 @@
     
     _fragmentBuffers[index] = buffer;
     _fragmentBufferOffsets[index] = offset;
-    
-    // TODO: Emit PM4 for fragment buffer
+
+    const RDNA4Binding* binding = [self bindingIn:_currentPipelineState.fragmentBindings
+                                             kind:2 location:index];
+    if (binding && [buffer isKindOfClass:[RDNA4Buffer class]]) {
+        RDNA4Buffer* rdnaBuffer = (RDNA4Buffer*)buffer;
+        [_pm4Builder setFragmentUserData:binding->userSgpr value:rdnaBuffer.gpuAddress + offset];
+    }
 }
 
 - (void)setVertexTexture:(id<MTLTexture>)texture
@@ -256,8 +300,24 @@
     }
     
     _vertexTextures[index] = texture;
-    
-    // TODO: Emit PM4 for vertex texture
+
+    const RDNA4Binding* binding = [self bindingIn:_currentPipelineState.vertexBindings
+                                             kind:0 location:index];
+    if (binding && [texture isKindOfClass:[RDNA4Texture class]]) {
+        [_pm4Builder setVertexUserData:binding->userSgpr
+                                 value:[(RDNA4Texture*)texture descriptorAddress]];
+    }
+}
+
+- (void)setVertexSamplerState:(id<MTLSamplerState>)sampler
+                      atIndex:(NSUInteger)index {
+    if (index >= 31) return;
+    const RDNA4Binding* binding = [self bindingIn:_currentPipelineState.vertexBindings
+                                             kind:1 location:index];
+    if (binding && [sampler isKindOfClass:[RDNA4SamplerState class]]) {
+        [_pm4Builder setVertexUserData:binding->userSgpr
+                                 value:[(RDNA4SamplerState*)sampler gpuAddress]];
+    }
 }
 
 - (void)setFragmentTexture:(id<MTLTexture>)texture
@@ -267,8 +327,28 @@
     }
     
     _fragmentTextures[index] = texture;
-    
-    // TODO: Emit PM4 for fragment texture
+
+    const RDNA4Binding* binding = [self bindingIn:_currentPipelineState.fragmentBindings
+                                             kind:0 location:index];
+    if (binding && [texture isKindOfClass:[RDNA4Texture class]]) {
+        uint64_t address = [(RDNA4Texture*)texture descriptorAddress];
+        NSLog(@"RDNA4RenderCommandEncoder: fragment texture %lu -> s%u desc=0x%llx",
+              (unsigned long)index, binding->userSgpr, address);
+        [_pm4Builder setFragmentUserData:binding->userSgpr value:address];
+    }
+}
+
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler
+                        atIndex:(NSUInteger)index {
+    if (index >= 31) return;
+    const RDNA4Binding* binding = [self bindingIn:_currentPipelineState.fragmentBindings
+                                             kind:1 location:index];
+    if (binding && [sampler isKindOfClass:[RDNA4SamplerState class]]) {
+        uint64_t address = [(RDNA4SamplerState*)sampler gpuAddress];
+        NSLog(@"RDNA4RenderCommandEncoder: fragment sampler %lu -> s%u desc=0x%llx",
+              (unsigned long)index, binding->userSgpr, address);
+        [_pm4Builder setFragmentUserData:binding->userSgpr value:address];
+    }
 }
 
 - (void)setViewport:(MTLViewport)viewport {

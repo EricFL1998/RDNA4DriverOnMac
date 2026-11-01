@@ -130,14 +130,65 @@ entry:
     // ac_nir_export_position(): the position export carries DONE.
     testStageIO(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX, vertexIR, "export pos0");
     testStageIO(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX, vertexIR, "done");
-    // Parameters go to the attribute ring with a swizzled structured store.
-    testStageIO(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX, vertexIR, "buffer_store_b128");
-    testStageIO(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX, vertexIR, "idxen");
-    testStageLacks(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX, vertexIR, "global_store");
+    // Parameters go to the attribute ring with a structured store. The ring is
+    // a GPU VA in addrspace(1), so the emitted form is global_store_b128 (the
+    // same SADDR form the hardware triangle test validated).
+    testStageIO(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX, vertexIR, "global_store_b128");
     testStageIO(context, "fragmentShader", AIRNT_FUNCTION_TYPE_FRAGMENT, fragmentIR, "ds_param_load");
     testStageIO(context, "fragmentShader", AIRNT_FUNCTION_TYPE_FRAGMENT, fragmentIR, "v_interp_p10_f32");
     testStageIO(context, "fragmentShader", AIRNT_FUNCTION_TYPE_FRAGMENT, fragmentIR, "export mrt0");
     testStageLacks(context, "fragmentShader", AIRNT_FUNCTION_TYPE_FRAGMENT, fragmentIR, "global_store");
+}
+
+static void testBindings(AIRNTContext context) {
+    const char* ir = R"IR(
+define <4 x float> @bindShader(<4 x float> %pos, ptr addrspace(1) %tex,
+                               ptr addrspace(2) %samp, ptr addrspace(2) %buf) {
+entry:
+  ret <4 x float> zeroinitializer
+}
+!air.fragment = !{!0}
+!0 = !{ptr @bindShader, !1, !2}
+!1 = !{!3}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!2 = !{!4, !5, !6, !7}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective",
+       !"air.arg_type_name", !"float4", !"air.arg_name", !"pos", !"air.arg_unused"}
+!5 = !{i32 1, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.sample",
+       !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!6 = !{i32 2, !"air.sampler", !"air.location_index", i32 1, i32 1,
+       !"air.arg_type_name", !"sampler", !"air.arg_name", !"samp"}
+!7 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1,
+       !"air.address_space", i32 2, !"air.arg_type_name", !"float4",
+       !"air.arg_name", !"buf"}
+)IR";
+    auto bitcode = makeAIRBitcode(ir);
+    AIRNTCompileOptions options = {};
+    options.entryPointName = "bindShader";
+    options.functionType = AIRNT_FUNCTION_TYPE_FRAGMENT;
+    AIRNTExecutable executable = nullptr;
+    char* error = nullptr;
+    assert(AIRNTCompile(context, bitcode.data(), bitcode.size(), &options,
+                        &executable, &error) == AIRNT_SUCCESS);
+
+    const AIRNTBinding* bindings = nullptr;
+    size_t count = 0;
+    assert(AIRNTGetBindings(executable, &bindings, &count) == AIRNT_SUCCESS);
+    assert(count == 3);
+    // Fragment system slots s2..s4 precede the resources, so the descriptors
+    // land at s5, s7 and s9 in AIR declaration order.
+    assert(bindings[0].kind == AIRNT_BINDING_TEXTURE);
+    assert(bindings[0].locationIndex == 2);
+    assert(bindings[0].userSgpr == 5);
+    assert(bindings[1].kind == AIRNT_BINDING_SAMPLER);
+    assert(bindings[1].locationIndex == 1);
+    assert(bindings[1].userSgpr == 7);
+    assert(bindings[2].kind == AIRNT_BINDING_BUFFER);
+    assert(bindings[2].locationIndex == 0);
+    assert(bindings[2].userSgpr == 9);
+    assert(bindings[2].addressSpace == 2);
+    AIRNTFreeExecutable(executable);
+    printf("  ✅ Binding reflection (3 resources, s5/s7/s9)\n");
 }
 
 static void testGraphicsStage(AIRNTContext context, const char* name, AIRNTFunctionType type) {
@@ -190,6 +241,7 @@ int main() {
     testGraphicsStage(context, "vertexShader", AIRNT_FUNCTION_TYPE_VERTEX);
     testGraphicsStage(context, "fragmentShader", AIRNT_FUNCTION_TYPE_FRAGMENT);
     testTriangleStageIO(context);
+    testBindings(context);
     
     // 4. Test error handling
     AIRNTExecutable exec;

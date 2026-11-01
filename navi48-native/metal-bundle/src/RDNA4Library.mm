@@ -13,6 +13,8 @@ typedef AIRNTStatus (*AIRNTCompile_t)(AIRNTContext ctx, const void* bitcode, siz
                                       AIRNTExecutable* exec, char** error);
 typedef AIRNTStatus (*AIRNTGetMachineCode_t)(AIRNTExecutable exec, const void** code, size_t* size);
 typedef AIRNTStatus (*AIRNTGetMetadata_t)(AIRNTExecutable exec, AIRNTShaderMetadata* metadata);
+typedef AIRNTStatus (*AIRNTGetBindings_t)(AIRNTExecutable exec, const AIRNTBinding** bindings,
+                                         size_t* count);
 typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
 
 @implementation RDNA4Library {
@@ -30,6 +32,7 @@ typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
     AIRNTCompile_t _airntCompile;
     AIRNTGetMachineCode_t _airntGetMachineCode;
     AIRNTGetMetadata_t _airntGetMetadata;
+    AIRNTGetBindings_t _airntGetBindings;
     AIRNTFreeExecutable_t _airntFreeExecutable;
 }
 
@@ -119,6 +122,7 @@ typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
     _airntCompile = (AIRNTCompile_t)dlsym(_airntHandle, "AIRNTCompile");
     _airntGetMachineCode = (AIRNTGetMachineCode_t)dlsym(_airntHandle, "AIRNTGetMachineCode");
     _airntGetMetadata = (AIRNTGetMetadata_t)dlsym(_airntHandle, "AIRNTGetMetadata");
+    _airntGetBindings = (AIRNTGetBindings_t)dlsym(_airntHandle, "AIRNTGetBindings");
     _airntFreeExecutable = (AIRNTFreeExecutable_t)dlsym(_airntHandle, "AIRNTFreeExecutable");
     
     if (!_airntInit || !_airntCompile) {
@@ -263,6 +267,24 @@ typedef void (*AIRNTFreeExecutable_t)(AIRNTExecutable exec);
     compiled.pgmRsrc1 = metadata.pgmRsrc1;
     compiled.pgmRsrc2 = metadata.pgmRsrc2;
     compiled.vertexParameterCount = metadata.vertexParameterCount;
+    if (_airntGetBindings) {
+        const AIRNTBinding* rawBindings = NULL;
+        size_t bindingCount = 0;
+        if (_airntGetBindings(executable, &rawBindings, &bindingCount) == AIRNT_SUCCESS &&
+            rawBindings && bindingCount > 0) {
+            NSMutableData* data = [NSMutableData dataWithLength:bindingCount * sizeof(RDNA4Binding)];
+            RDNA4Binding* out = (RDNA4Binding*)data.mutableBytes;
+            for (size_t i = 0; i < bindingCount; ++i) {
+                out[i].userSgpr = rawBindings[i].userSgpr;
+                out[i].locationIndex = rawBindings[i].locationIndex;
+                out[i].kind = rawBindings[i].kind;
+                out[i].addressSpace = rawBindings[i].addressSpace;
+            }
+            compiled.bindings = data;
+        }
+    }
+    NSLog(@"RDNA4Library: '%@' bindings=%zu",
+          functionName, compiled.bindings.length / sizeof(RDNA4Binding));
     _compiledShaders[functionName] = compiled;
     _airntFreeExecutable(executable);
 

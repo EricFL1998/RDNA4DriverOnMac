@@ -50,6 +50,22 @@ typedef struct {
     uint32_t vertexParameterCount;
 } AIRNTShaderMetadata;
 
+// Resource binding layout of the generated shader. The driver writes the
+// descriptor address (low 32 bits at userSgpr, high 32 bits at userSgpr + 1)
+// for the Metal resource bound at locationIndex.
+typedef enum {
+    AIRNT_BINDING_TEXTURE = 0,
+    AIRNT_BINDING_SAMPLER = 1,
+    AIRNT_BINDING_BUFFER  = 2
+} AIRNTBindingKind;
+
+typedef struct {
+    uint32_t userSgpr;        // Absolute SGPR index of the 64-bit descriptor address
+    uint32_t locationIndex;   // Metal binding index
+    uint32_t kind;            // AIRNTBindingKind
+    uint32_t addressSpace;    // AIR address space (1 = device, 2/4 = constant)
+} AIRNTBinding;
+
 // Compilation Options
 typedef struct {
     const char* entryPointName;   // Kernel/Function name
@@ -124,6 +140,17 @@ AIRNTStatus AIRNTGetMachineCode(AIRNTExecutable executable,
  */
 AIRNTStatus AIRNTGetMetadata(AIRNTExecutable executable,
                              AIRNTShaderMetadata* outMetadata);
+
+/**
+ * Get the resource binding table of the compiled shader
+ * @param executable Compiled executable
+ * @param outBindings Output binding array (owned by the executable; may be NULL when count is 0)
+ * @param outCount Output number of bindings
+ * @return AIRNT_SUCCESS or error code
+ */
+AIRNTStatus AIRNTGetBindings(AIRNTExecutable executable,
+                             const AIRNTBinding** outBindings,
+                             size_t* outCount);
 
 /**
  * Get GFX12 assembly listing (for debugging)

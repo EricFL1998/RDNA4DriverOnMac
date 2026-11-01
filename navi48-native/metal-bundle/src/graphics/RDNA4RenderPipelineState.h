@@ -36,6 +36,10 @@
  */
 - (uint64_t)fragmentShaderGPUAddress;
 
+/** Resource binding tables of the two stages (internal use). */
+- (NSData*)vertexBindings;
+- (NSData*)fragmentBindings;
+
 @property (readonly) uint64_t attributeRingGPUAddress;
 @property (readonly) uint32_t attributeRingSize;
 

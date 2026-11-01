@@ -3,6 +3,7 @@
 #import "RDNA4UserClient.h"
 #import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurface.h>
+#include "gfx12_descriptors.h"
 
 @implementation RDNA4Texture {
     RDNA4Device* _device;
@@ -18,9 +19,13 @@
     MTLTextureUsage _usage;
     
     uint64_t _gpuAddress;
+    uint64_t _descriptorAddress;
     size_t _allocationSize;
     void* _mappedMemory;
+    void* _gpuMappedMemory;
     IOSurfaceRef _iosurface;
+    NSUInteger _iosurfacePlane;
+    BOOL _gpuRendered;
     
     BOOL _isRenderTarget;
     BOOL _isShaderReadable;
@@ -52,6 +57,7 @@
         if (![self allocateGPUMemory]) {
             return nil;
         }
+        [self buildImageDescriptor];
         
         NSLog(@"RDNA4Texture: Created %lux%lu texture, format=%lu, GPU=0x%llx",
               _width, _height, (unsigned long)_pixelFormat, _gpuAddress);
@@ -81,10 +87,27 @@
         _arrayLength = 1;
         _usage = descriptor.usage;
         _resourceOptions = MTLResourceStorageModeShared;
-        
-        // Get GPU address from IOSurface
-        // In real implementation, would need to map IOSurface to GPU
-        _gpuAddress = 0;  // TODO: Map IOSurface
+        _isRenderTarget = (descriptor.usage & MTLTextureUsageRenderTarget) != 0;
+        _isShaderReadable = (descriptor.usage & MTLTextureUsageShaderRead) != 0;
+
+        _iosurfacePlane = plane;
+        _mappedMemory = IOSurfaceGetBaseAddressOfPlane(iosurface, plane);
+        _allocationSize = [self calculateAllocationSize];
+        _gpuRendered = NO;
+
+        // The GPU needs a real GPU address. Allocate a staging buffer in the
+        // driver window and mirror the IOSurface into it; CPU reads/writes keep
+        // using the IOSurface, and readback copies the staging buffer back.
+        RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+        if (link) {
+            _gpuAddress = RDNA4GpuAllocate(link, _allocationSize);
+            if (_gpuAddress) {
+                _gpuMappedMemory = RDNA4GpuPointerForAddress(link, _gpuAddress);
+                if (_gpuMappedMemory) memset(_gpuMappedMemory, 0, _allocationSize);
+            }
+        }
+        [self synchronizeFromIOSurface];
+        [self buildImageDescriptor];
         
         NSLog(@"RDNA4Texture: Created from IOSurface %lux%lu", _width, _height);
     }
@@ -93,8 +116,13 @@
 
 - (void)dealloc {
     // Free GPU memory
-    if (_gpuAddress != 0 && !_iosurface) {
+    if (_gpuAddress != 0) {
         [self freeGPUMemory];
+    }
+    if (_descriptorAddress != 0) {
+        RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+        if (link) RDNA4GpuFree(link, _descriptorAddress);
+        _descriptorAddress = 0;
     }
     
     if (_iosurface) {
@@ -205,8 +233,17 @@
 - (NSUInteger)bytesPerRowForLevel:(NSUInteger)level {
     NSUInteger levelWidth = MAX(1, _width >> level);
     size_t bytesPerPixel = [self bytesPerPixelForFormat:_pixelFormat];
-    
-    return levelWidth * bytesPerPixel;
+
+    // GFX12 colour surfaces need a row pitch of at least 128 bytes: an 8-pixel
+    // BGRA8 target (32-byte rows) never received a fragment, while 16 pixels
+    // and above worked. The colour target writes MIP0_WIDTH from this pitch and
+    // the image descriptor carries it in DEPTH/PITCH_MSB.
+    NSUInteger rowBytes = levelWidth * bytesPerPixel;
+    return (rowBytes + 127) & ~(NSUInteger)127;
+}
+
+- (NSUInteger)pitchTexelsForLevel:(NSUInteger)level {
+    return [self bytesPerRowForLevel:level] / [self bytesPerPixelForFormat:_pixelFormat];
 }
 
 - (NSUInteger)bytesPerImageForLevel:(NSUInteger)level {
@@ -250,6 +287,7 @@
                source + y * bytesPerRow,
                region.size.width * bytesPerPixel);
     }
+    [self synchronizeFromIOSurface];
 }
 
 - (void)getBytes:(void*)pixelBytes
@@ -280,6 +318,11 @@
         (region.origin.y + region.size.height - (region.size.height ? 1 : 0)) * rowBytes +
         (region.origin.x + region.size.width) * bytesPerPixel;
     if (lastByte > _allocationSize) return;
+
+    if (_gpuRendered) {
+        [self synchronizeFromGPU];
+        _gpuRendered = NO;
+    }
 
     const uint8_t* source = (const uint8_t*)_mappedMemory + offset;
     uint8_t* destination = (uint8_t*)pixelBytes + slice * bytesPerImage;
@@ -419,7 +462,125 @@
 }
 
 - (NSUInteger)iosurfacePlane {
-    return 0;
+    return _iosurfacePlane;
+}
+
+- (void)markGPURendered {
+    _gpuRendered = YES;
+}
+
+- (void)synchronizeFromIOSurface {
+    if (!_iosurface || !_mappedMemory || !_gpuMappedMemory) return;
+    const size_t rowBytes = [self bytesPerRowForLevel:0];
+    const size_t surfaceRowBytes = IOSurfaceGetBytesPerRowOfPlane(_iosurface, _iosurfacePlane);
+    if (!rowBytes || !surfaceRowBytes) return;
+    for (NSUInteger y = 0; y < _height; ++y) {
+        memcpy((uint8_t*)_gpuMappedMemory + y * rowBytes,
+               (const uint8_t*)_mappedMemory + y * surfaceRowBytes,
+               MIN(rowBytes, surfaceRowBytes));
+    }
+}
+
+- (void)synchronizeFromGPU {
+    if (!_iosurface || !_mappedMemory || !_gpuMappedMemory) return;
+    const size_t rowBytes = [self bytesPerRowForLevel:0];
+    const size_t surfaceRowBytes = IOSurfaceGetBytesPerRowOfPlane(_iosurface, _iosurfacePlane);
+    if (!rowBytes || !surfaceRowBytes) return;
+    for (NSUInteger y = 0; y < _height; ++y) {
+        memcpy((uint8_t*)_mappedMemory + y * surfaceRowBytes,
+               (const uint8_t*)_gpuMappedMemory + y * rowBytes,
+               MIN(rowBytes, surfaceRowBytes));
+    }
+}
+
+- (uint32_t)gfx12FormatForPixelFormat:(MTLPixelFormat)format {
+    switch (format) {
+        case MTLPixelFormatR8Unorm: return kGfx12Fmt_8_UNORM;
+        case MTLPixelFormatR8Uint: return kGfx12Fmt_8_UINT;
+        case MTLPixelFormatRG8Unorm: return kGfx12Fmt_8_8_UNORM;
+        case MTLPixelFormatR16Float: return kGfx12Fmt_16_FLOAT;
+        case MTLPixelFormatRG16Float: return kGfx12Fmt_16_16_FLOAT;
+        case MTLPixelFormatRGBA16Float: return kGfx12Fmt_16_16_16_16_FLOAT;
+        case MTLPixelFormatR32Float: return kGfx12Fmt_32_FLOAT;
+        case MTLPixelFormatRG32Float: return kGfx12Fmt_32_32_FLOAT;
+        case MTLPixelFormatRGBA32Float: return kGfx12Fmt_32_32_32_32_FLOAT;
+        case MTLPixelFormatR32Uint: return kGfx12Fmt_32_UINT;
+        case MTLPixelFormatRGBA8Uint: return kGfx12Fmt_8_8_8_8_UINT;
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Unorm_sRGB: return kGfx12Fmt_8_8_8_8_SRGB;
+        default: return kGfx12Fmt_8_8_8_8_UNORM;
+    }
+}
+
+- (void)buildImageDescriptor {
+    if (!_gpuAddress) return;
+
+    const size_t bpp = MAX((size_t)1, [self bytesPerPixelForFormat:_pixelFormat]);
+    const size_t rowBytes = [self bytesPerRowForLevel:0];
+    Gfx12ImageDesc descriptor = {};
+    descriptor.gpuAddress = _gpuAddress;
+    descriptor.width = (uint32_t)MAX((NSUInteger)1, _width);
+    descriptor.height = (uint32_t)MAX((NSUInteger)1, _height);
+    descriptor.depth = (uint32_t)MAX((NSUInteger)1, _arrayLength);
+    descriptor.pitchTexels = (uint32_t)(rowBytes / bpp);
+    descriptor.format = [self gfx12FormatForPixelFormat:_pixelFormat];
+    descriptor.swizzleMode = kGfx12SwizzleLinear;
+    descriptor.numLevels = (uint32_t)MAX((NSUInteger)1, _mipmapLevelCount);
+    switch (_textureType) {
+        case MTLTextureType1D: descriptor.type = kGfx12ImgType1D; break;
+        case MTLTextureType3D: descriptor.type = kGfx12ImgType3D; break;
+        case MTLTextureTypeCube: descriptor.type = kGfx12ImgTypeCube; break;
+        case MTLTextureType1DArray: descriptor.type = kGfx12ImgType1DArray; break;
+        case MTLTextureType2DArray: descriptor.type = kGfx12ImgType2DArray; break;
+        default: descriptor.type = kGfx12ImgType2D; break;
+    }
+    const bool bgra = (_pixelFormat == MTLPixelFormatBGRA8Unorm ||
+                       _pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB);
+    descriptor.dstSel[0] = bgra ? kGfx12SelZ : kGfx12SelX;
+    descriptor.dstSel[1] = kGfx12SelY;
+    descriptor.dstSel[2] = bgra ? kGfx12SelX : kGfx12SelZ;
+    descriptor.dstSel[3] = kGfx12SelW;
+
+    uint32_t words[8];
+    gfx12MakeImageDescriptor(&descriptor, words);
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (!link) return;
+    _descriptorAddress = RDNA4GpuAllocate(link, sizeof(words));
+    void* mapped = _descriptorAddress ? RDNA4GpuPointerForAddress(link, _descriptorAddress) : NULL;
+    if (!mapped) {
+        if (_descriptorAddress) RDNA4GpuFree(link, _descriptorAddress);
+        _descriptorAddress = 0;
+        return;
+    }
+    memcpy(mapped, words, sizeof(words));
+}
+
+- (uint64_t)descriptorAddress {
+    return _descriptorAddress;
+}
+
+- (void)getBytes:(void*)pixelBytes
+     bytesPerRow:(NSUInteger)bytesPerRow
+      fromRegion:(MTLRegion)region
+     mipmapLevel:(NSUInteger)level {
+    [self getBytes:pixelBytes
+       bytesPerRow:bytesPerRow
+     bytesPerImage:bytesPerRow * MAX((NSUInteger)1, region.size.height)
+        fromRegion:region
+      mipmapLevel:level
+            slice:0];
+}
+
+- (void)replaceRegion:(MTLRegion)region
+          mipmapLevel:(NSUInteger)level
+            withBytes:(const void*)pixelBytes
+          bytesPerRow:(NSUInteger)bytesPerRow {
+    [self replaceRegion:region
+            mipmapLevel:level
+                  slice:0
+              withBytes:pixelBytes
+            bytesPerRow:bytesPerRow
+          bytesPerImage:bytesPerRow * MAX((NSUInteger)1, region.size.height)];
 }
 
 @end

@@ -1,5 +1,8 @@
 #include "AIRLinker.hpp"
 #include "AIRGraphicsLowering.hpp"
+#include "AIRBuiltins.hpp"
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -10,6 +13,102 @@
 #include <llvm/Support/raw_ostream.h>
 
 namespace air2gfx12 {
+
+namespace {
+
+bool hasTag(llvm::MDNode* node, const char* tag) {
+    if (!node) return false;
+    for (const llvm::MDOperand& operand : node->operands()) {
+        auto* string = llvm::dyn_cast_or_null<llvm::MDString>(operand);
+        if (string && string->getString() == tag) return true;
+    }
+    return false;
+}
+
+bool uintOperand(llvm::MDNode* node, unsigned index, uint32_t& value) {
+    if (!node || index >= node->getNumOperands()) return false;
+    auto* constant = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(node->getOperand(index));
+    if (!constant) return false;
+    value = static_cast<uint32_t>(constant->getZExtValue());
+    return true;
+}
+
+std::string stringOperand(llvm::MDNode* node, unsigned index) {
+    if (!node || index >= node->getNumOperands()) return {};
+    auto* string = llvm::dyn_cast_or_null<llvm::MDString>(node->getOperand(index));
+    return string ? string->getString().str() : std::string();
+}
+
+// The lowered graphics signature carries one 64-bit inreg argument per used
+// resource, in AIR declaration order. The vertex stage keeps the first two
+// resources in the reserved i32 pairs s12:s13 and s14:s15 (inside the GS
+// user-data bank the driver can actually deliver) and appends the rest after
+// the 17 system slots (s19+). The fragment stage starts at s5.
+void extractBindings(llvm::Module& module, const std::string& entryName,
+                     ShaderStage stage, std::vector<ShaderBinding>& out) {
+    out.clear();
+    const char* metadataName = stage == ShaderStage::Vertex ? "air.vertex" :
+                               stage == ShaderStage::Fragment ? "air.fragment" : nullptr;
+    if (!metadataName || entryName.empty()) return;
+    llvm::NamedMDNode* named = module.getNamedMetadata(metadataName);
+    if (!named) return;
+
+    llvm::MDNode* description = nullptr;
+    for (llvm::MDNode* candidate : named->operands()) {
+        if (!candidate || candidate->getNumOperands() < 3) continue;
+        auto* value = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(candidate->getOperand(0));
+        if (value && value->getValue()->getName().str() == entryName) {
+            description = candidate;
+            break;
+        }
+    }
+    if (!description) return;
+
+    auto* inputs = llvm::dyn_cast_or_null<llvm::MDNode>(description->getOperand(2));
+    if (!inputs) return;
+
+    uint32_t ordinal = 0;
+    for (const llvm::MDOperand& operand : inputs->operands()) {
+        auto* input = llvm::dyn_cast_or_null<llvm::MDNode>(operand);
+        if (!input || hasTag(input, "air.arg_unused")) continue;
+
+        ShaderBinding binding;
+        if (hasTag(input, "air.texture")) binding.kind = 0;
+        else if (hasTag(input, "air.sampler")) binding.kind = 1;
+        else if (hasTag(input, "air.buffer")) binding.kind = 2;
+        else continue;
+
+        for (unsigned index = 0; index + 1 < input->getNumOperands(); ++index) {
+            auto* tag = llvm::dyn_cast_or_null<llvm::MDString>(input->getOperand(index));
+            if (!tag) continue;
+            const llvm::StringRef name = tag->getString();
+            if (name == "air.location_index") {
+                uint32_t value = 0;
+                if (uintOperand(input, index + 1, value)) binding.locationIndex = value;
+            } else if (name == "air.address_space") {
+                uint32_t value = 0;
+                if (uintOperand(input, index + 1, value)) binding.addressSpace = value;
+            } else if (name == "air.arg_name") {
+                binding.name = stringOperand(input, index + 1);
+            }
+        }
+
+        if (binding.addressSpace == 0) binding.addressSpace = binding.kind == 0 ? 1u : 2u;
+        if (stage == ShaderStage::Vertex) {
+            // The vertex stage keeps the first two resources in the reserved
+            // i32 pairs s12:s13 and s14:s15 and appends the rest after the 17
+            // system slots. The fragment stage starts its resources at s5.
+            binding.userSgpr = ordinal < 2u ? 12u + 2u * ordinal
+                                            : 19u + 2u * (ordinal - 2u);
+        } else {
+            binding.userSgpr = 5u + 2u * ordinal;
+        }
+        ++ordinal;
+        out.push_back(std::move(binding));
+    }
+}
+
+} // namespace
 
 AIRLinker::AIRLinker(llvm::LLVMContext& context)
     : mContext(context) {}
@@ -55,6 +154,8 @@ std::unique_ptr<llvm::Module> AIRLinker::loadAndLink(const uint8_t* bitcodeData,
     }
 
     std::unique_ptr<llvm::Module> userModule = std::move(modOrErr.get());
+
+    extractBindings(*userModule, entryName, stage, mBindings);
 
     // If runtime is loaded, link only the needed symbols
     if (mRuntimeTemplate) {
@@ -105,6 +206,15 @@ std::unique_ptr<llvm::Module> AIRLinker::loadAndLink(const uint8_t* bitcodeData,
         if (outError) *outError = "Failed to parse lowered IR: " + smErr.getMessage().str();
         return userModule; // Fallback
     }
+
+    if (!lowerRuntimeBuiltins(*loweredModule, outError)) {
+        return nullptr;
+    }
+
+    inlineHelperFunctions(*loweredModule, entryName);
+    foldFunctionConstants(*loweredModule);
+    propagateStoredConstants(*loweredModule);
+    pruneStaticInit(*loweredModule);
 
     return loweredModule;
 }

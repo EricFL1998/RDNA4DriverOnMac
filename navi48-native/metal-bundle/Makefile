@@ -21,6 +21,7 @@ OBJC_SOURCES = \
 	$(SRC_DIR)/RDNA4Function.m \
 	$(SRC_DIR)/RDNA4ComputePipelineState.m \
 	$(SRC_DIR)/RDNA4Buffer.m \
+	$(SRC_DIR)/RDNA4SamplerState.m \
 	$(SRC_DIR)/RDNA4UserClient.m \
 	$(SRC_DIR)/RDNA4CommandQueue.m \
 	$(SRC_DIR)/RDNA4CommandBuffer.m \

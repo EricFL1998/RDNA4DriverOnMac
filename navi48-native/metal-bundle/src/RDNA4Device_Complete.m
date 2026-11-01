@@ -2,6 +2,8 @@
 #import "RDNA4CommandQueue.h"
 #import "RDNA4Buffer.h"
 #import "graphics/RDNA4Texture.h"
+#import "RDNA4SamplerState.h"
+#import "RDNA4UserClient.h"
 #import "RDNA4Library.h"
 #import "RDNA4Function.h"
 #import "RDNA4ComputePipelineState.h"
@@ -14,6 +16,8 @@
     uint64_t _vramSize;
     io_service_t _rdna4AcceleratorPort;
     id _rdna4AcceleratorService;
+    uint64_t _nggRingAddress;
+    uint32_t _nggRingSize;
 }
 
 + (void)load {
@@ -209,6 +213,31 @@
 
 #pragma mark - Buffer Creation
 
+- (uint64_t)sharedNGGRingAddress:(uint32_t*)outSize {
+    if (_nggRingAddress) {
+        if (outSize) *outSize = _nggRingSize;
+        return _nggRingAddress;
+    }
+    RDNA4GpuLink* link = RDNA4GpuLinkAcquire();
+    if (!link) return 0;
+    // 0x580000 attribute ring + position/primitive rings, plus one 64 KiB
+    // alignment slot at each end of the allocation.
+    const uint64_t needed = 0xA80000ull;
+    uint64_t raw = RDNA4GpuAllocate(link, needed + 2ull * 0x10000ull);
+    if (!raw) return 0;
+    const uint64_t base = (raw + 0xFFFFull) & ~0xFFFFull;
+    void* mapped = RDNA4GpuPointerForAddress(link, base);
+    if (!mapped) {
+        RDNA4GpuFree(link, raw);
+        return 0;
+    }
+    memset(mapped, 0, needed);
+    _nggRingAddress = base;
+    _nggRingSize = (uint32_t)needed;
+    if (outSize) *outSize = _nggRingSize;
+    return base;
+}
+
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
     return [[RDNA4Buffer alloc] initWithDevice:self length:length options:options];
 }
@@ -231,6 +260,16 @@
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor {
     return [[RDNA4Texture alloc] initWithDevice:self descriptor:descriptor];
+}
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor
+                                 iosurface:(IOSurfaceRef)iosurface
+                                    plane:(NSUInteger)plane {
+    if (!iosurface || !descriptor) return nil;
+    return [[RDNA4Texture alloc] initWithDevice:self
+                                      iosurface:iosurface
+                                     descriptor:descriptor
+                                          plane:plane];
 }
 
 - (id<MTLTexture>)newSharedTextureWithDescriptor:(MTLTextureDescriptor*)descriptor {
@@ -352,8 +391,8 @@
 #pragma mark - Sampler State
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor*)descriptor {
-    NSLog(@"RDNA4Device: Sampler state not yet implemented");
-    return nil;
+    if (!descriptor) return nil;
+    return [[RDNA4SamplerState alloc] initWithDevice:self descriptor:descriptor];
 }
 
 #pragma mark - Depth/Stencil State
